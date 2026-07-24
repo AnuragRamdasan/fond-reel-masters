@@ -1,0 +1,230 @@
+name: Archive Integrity Check
+
+on:
+  push:
+    paths:
+      - 'masters/**'
+      - '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/**'
+      - 'ads-bridge/**'
+  pull_request:
+    paths:
+      - 'masters/**'
+      - '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/**'
+      - 'ads-bridge/**'
+  workflow_dispatch:
+    inputs:
+      scan_all:
+        description: 'Scan entire archive (slow)'
+        required: false
+        default: 'false'
+
+jobs:
+  integrity-check:
+    name: Verify archive integrity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need parent commit to detect changed dirs
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pillow 2>/dev/null || true  # optional for contact sheets
+
+      - name: Detect changed directories
+        id: changed-dirs
+        run: |
+          if [[ "${{ github.event.inputs.scan_all }}" == "true" ]]; then
+            echo "scan_all=true" >> $GITHUB_OUTPUT
+          else
+            # Get directories changed in this push
+            git diff --name-only HEAD~1 HEAD | \
+              grep -E '^(masters/[^/]+|[0-9]{4}-[0-9]{2}-[0-9]{2}|ads-bridge/[^/]+)' | \
+              sed 's|/.*||' | sort -u > /tmp/changed_dirs.txt
+            # Also catch top-level date dirs
+            git diff --name-only HEAD~1 HEAD | \
+              grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}/' | \
+              cut -d/ -f1 | sort -u >> /tmp/changed_dirs.txt
+            cat /tmp/changed_dirs.txt
+            echo "scan_all=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run integrity check
+        id: integrity
+        run: |
+          set +e  # Don't exit on error, capture return code
+
+          if [[ "${{ steps.changed-dirs.outputs.scan_all }}" == "true" ]]; then
+            python tools/verify_integrity.py --all --repo-root . 2>&1 | tee /tmp/integrity_output.txt
+            EXIT_CODE=${PIPESTATUS[0]}
+          else
+            EXIT_CODE=0
+            while IFS= read -r dir; do
+              if [ -d "$dir" ]; then
+                echo "Checking: $dir"
+                python tools/verify_integrity.py --dir "$dir" --repo-root . 2>&1 | tee -a /tmp/integrity_output.txt
+                if [ ${PIPESTATUS[0]} -ne 0 ]; then
+                  EXIT_CODE=1
+                fi
+              fi
+            done < /tmp/changed_dirs.txt
+          fi
+
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "output_summary<<EOF" >> $GITHUB_OUTPUT
+          tail -50 /tmp/integrity_output.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Check for missing manifests
+        id: missing-manifests
+        run: |
+          MISSING=""
+          # Check all masters/ subdirs
+          for dir in masters/*/; do
+            if [ -d "$dir" ] && [ ! -f "${dir}manifest.json" ]; then
+              MISSING="$MISSING\n- $dir"
+            fi
+          done
+          # Check date-named dirs
+          for dir in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/; do
+            if [ -d "$dir" ]; then
+              if [ ! -f "${dir}manifest.json" ] && [ ! -f "${dir}master.sha256" ] && [ ! -f "${dir}SHA256.txt" ]; then
+                MISSING="$MISSING\n- $dir"
+              fi
+            fi
+          done
+
+          if [ -n "$MISSING" ]; then
+            echo "missing_dirs<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$MISSING" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "has_missing=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_missing=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto-generate missing manifests
+        if: steps.missing-manifests.outputs.has_missing == 'true'
+        run: |
+          python tools/normalize_manifest.py --all --write --repo-root .
+
+      - name: Commit auto-generated manifests
+        if: steps.missing-manifests.outputs.has_missing == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A '**/manifest.json' '**/*.bak'
+          if git diff --staged --quiet; then
+            echo "No manifest changes to commit"
+          else
+            git commit -m "ci: auto-generate missing manifests [skip ci]
+
+  Directories with missing manifests detected during integrity check.
+  Auto-generated schema v2 manifest stubs via normalize_manifest.py.
+  Run verify_integrity.py locally to compute SHA256 values.
+
+  Missing dirs:
+  ${{ steps.missing-manifests.outputs.missing_dirs }}"
+            git push
+          fi
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const exitCode = '${{ steps.integrity.outputs.exit_code }}';
+            const summary = `${{ steps.integrity.outputs.output_summary }}`;
+            const hasMissing = '${{ steps.missing-manifests.outputs.has_missing }}' === 'true';
+            const missingDirs = `${{ steps.missing-manifests.outputs.missing_dirs }}`;
+
+            const status = exitCode === '0' ? '✅ All integrity checks passed' : '❌ Integrity check failures detected';
+            const missingSection = hasMissing
+              ? `\n\n**⚠️ Missing manifests auto-generated for:**\n${missingDirs}`
+              : '';
+
+            const body = `## Archive Integrity Report
+
+            ${status}${missingSection}
+
+            <details>
+            <summary>Full output</summary>
+
+            \`\`\`
+            ${summary.slice(-3000)}
+            \`\`\`
+            </details>
+
+            > Generated by \`tools/verify_integrity.py\` — [Bug #3 fix](https://github.com/AnuragRamdasan/fond-reel-masters/blob/main/tools/verify_integrity.py)`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Open issue on failure
+        if: steps.integrity.outputs.exit_code != '0' && github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const summary = `${{ steps.integrity.outputs.output_summary }}`;
+            const commit = context.sha.slice(0, 8);
+            const branch = context.ref.replace('refs/heads/', '');
+
+            // Check if an open issue already exists
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'archive-integrity',
+            });
+
+            const title = `🚨 Archive integrity failure on ${branch} @ ${commit}`;
+
+            if (existing.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: `## Archive Integrity Failure
+
+            **Commit:** ${context.sha}
+            **Branch:** ${branch}
+            **Triggered by:** ${context.actor}
+
+            Part count inconsistency or SHA256 mismatch detected in the archive.
+            This may indicate a partial upload failure (like the reel24 part_05 retry incident).
+
+            **Output:**
+            \`\`\`
+            ${summary.slice(-4000)}
+            \`\`\`
+
+            **To fix:**
+            1. Run \`python tools/verify_integrity.py --all\` locally
+            2. Re-upload any missing or corrupt parts
+            3. Run \`python tools/normalize_manifest.py --all --write\` to regenerate manifests
+            4. Push fixes — this issue will auto-close when checks pass`,
+                labels: ['archive-integrity', 'bug'],
+                assignees: ['AnuragRamdasan'],
+              });
+            }
+
+      - name: Fail workflow on integrity errors
+        if: steps.integrity.outputs.exit_code != '0'
+        run: |
+          echo "❌ Archive integrity check failed. See output above."
+          exit 1
