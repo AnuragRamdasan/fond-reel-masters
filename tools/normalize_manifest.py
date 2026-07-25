@@ -2,9 +2,17 @@
 """
 normalize_manifest.py – Manifest schema normalizer for fond-reel-masters.
 
-Fixes:
+Fixes (historical):
   Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
                  Python's all() returning True over an empty iterable (vacuous truth).
+
+Fixes (2026-07-26):
+  Bug D (HIGH): scan_all() iterated over p.iterdir() for ads-bridge/ and masters/
+                without filtering to directories only. Loose files (README.md,
+                .gitignore, etc.) were appended to dirs and passed to
+                process_directory(), which called directory.rglob("*") on a file
+                path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
+                guard in both loops.
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -192,7 +200,9 @@ def process_directory(directory: Path, write: bool = False) -> bool:
         return False
 
     out_path = directory / "manifest.json"
-    print(f"  {'\U0001f4dd' if write else '\U0001f441'} {directory.name}: {action}")
+    pencil = "\U0001f4dd"
+    eye = "\U0001f441"
+    print(f"  {pencil if write else eye} {directory.name}: {action}")
 
     if write:
         if out_path.exists():
@@ -219,15 +229,20 @@ def scan_all(root: Path, write: bool = False) -> int:
         if item.is_dir() and DATE_RE.match(item.name):
             dirs.append(item)
 
+    # FIX Bug D: add `if sub.is_dir()` guard. Previously, p.iterdir() yielded
+    # all entries including loose files (README.md, .gitignore, etc.). Passing a
+    # file path to process_directory() caused detect_schema() to look for
+    # "file/manifest.json" (never exists), then create_empty_manifest() to call
+    # directory.rglob("*") on a file → NotADirectoryError in Python 3.11+.
     for parent in ["ads-bridge", "masters"]:
         p = root / parent
         if p.exists():
             for sub in p.iterdir():
-                if sub.is_dir():
+                if sub.is_dir():  # FIX Bug D: only append actual directories
                     dirs.append(sub)
 
     for d in sorted(dirs):
-        print(f"\n\U0001f4c1 {d.relative_to(root)}")
+        print(f"\n📁 {d.relative_to(root)}")
         changed = process_directory(d, write=write)
         if changed:
             count += 1
@@ -246,7 +261,7 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("\U0001f441 DRY RUN – pass --write to apply changes\n")
+        print("👁 DRY RUN – pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
