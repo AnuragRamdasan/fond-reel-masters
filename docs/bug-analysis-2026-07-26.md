@@ -1,129 +1,191 @@
-# Bug Analysis: CI Layer Bugs #9–#12
-**Date**: 2026-07-26 | **Repo**: AnuragRamdasan/fond-reel-masters | **4 new bugs fixed in CI workflow**
+# KeepFond — fond-reel-masters Bug Analysis
+**Date:** 2026-07-26  
+**Scope:** Live code audit of `tools/` and `.github/workflows/archive_integrity.yml`  
+**Author:** Parallel Loop automated triage  
+**Status:** All 4 bugs fixed in same commit batch
 
 ---
 
-## Context
+## Summary
 
-After fixing Bugs #1–#8 (tool-level Python bugs) on 2026-07-25, the `archive_integrity.yml` CI workflow continued to fail on every single run — **31 consecutive failures**. The root causes were all in the CI workflow layer itself, not in the Python tools.
+Following the 13-bug fix cycle in PRs #1–#9 (documented in `docs/bug-analysis-2026-07-25.md`), a second live-code pass on 2026-07-26 identified **4 additional bugs** not covered by previous PRs.
+
+| ID | File | Severity | Description |
+|----|------|----------|-------------|
+| Bug C | `tools/verify_protagonist.py` | **CRITICAL** | `qa_dir` path collision — multiple `masters/YYYY-MM-DD-*` dirs share the same report path |
+| Bug D | `tools/normalize_manifest.py` | **HIGH** | `scan_all()` passes file paths (not dirs) to `process_directory()`, causing `NotADirectoryError` |
+| Bug E | `.github/workflows/archive_integrity.yml` | **HIGH** | Unguarded `grep` in "Detect changed directories" step aborts CI when no files match |
+| Bug F | `tools/verify_protagonist.py` | **MEDIUM** | `draw.rectangle()` fill alpha ignored on RGB image — contact sheet overlay is solid black not semi-transparent |
 
 ---
 
-## Bug #9 — CRITICAL: Integrity check runs before manifest auto-generation (step ordering inversion)
+## Bug C — CRITICAL: `qa_dir` collision in `verify_protagonist.py`
 
 ### Root Cause
-The 2026-07-25 fixes correctly made `manifest_missing` count as a failure in `verify_integrity.py` (Bug #1 fix). However, the CI workflow ran the integrity check **before** auto-generating missing manifests:
+In `verify_protagonist.py::main()`, when `--qa-dir` is not provided, the fallback computes:
 
-```
-OLD ORDER:
-  1. Run integrity check       ← detects missing manifest → exit_code=1
-  2. Check for missing manifests
-  3. Auto-generate manifests   ← correctly creates them (too late)
-  4. Fail workflow             ← fires on exit_code=1 from step 1
+```python
+m = re.search(r"\d{4}-\d{2}-\d{2}", target_dir.name)
+date = m.group(0) if m else target_dir.name
+qa_dir = repo_root / "qa" / date
 ```
 
-**Result**: Any run touching a directory without a manifest would:
-- Detect the missing manifest → `exit_code=1`
-- Later auto-generate the manifest correctly
-- Fail the workflow anyway, because the failure gate read `exit_code` from the **pre-auto-generation** integrity check
+`target_dir.name` is the **last path component** of `--dir`. For:
+- `--dir masters/2026-07-24-final` → `target_dir.name = "2026-07-24-final"` → `date = "2026-07-24"`
+- `--dir masters/2026-07-24-draft` → `target_dir.name = "2026-07-24-draft"` → `date = "2026-07-24"`
 
-This caused **every single push** to fail even when the only real issue was a missing manifest stub (which was immediately and correctly created).
+Both resolve to `qa/2026-07-24/`, so the second run **silently overwrites** the first's `protagonist_check.json` and `diag_faces.jpg`.
+
+When CI checks multiple same-date master variants (a common pattern: `final`, `draft`, `v2`), only the last run's report survives. This can mask a failing check.
 
 ### Fix
-Reorder the steps so manifest auto-generation runs first:
+Use the full path relative to repo root, mirroring the fix applied to `verify_integrity.py` (Bug #2 in PR #3):
 
-```
-NEW ORDER:
-  1. Check for missing manifests
-  2. Auto-generate manifests   ← creates stubs before integrity check
-  3. Commit auto-generated manifests
-  4. Run integrity check       ← now sees the generated manifests → passes
-  5. Run protagonist check
-  6. Fail workflow (only if real failures remain)
+```python
+# Before (broken)
+m = re.search(r"\d{4}-\d{2}-\d{2}", target_dir.name)
+date = m.group(0) if m else target_dir.name
+qa_dir = repo_root / "qa" / date
+
+# After (fixed)
+try:
+    rel = target_dir.relative_to(repo_root)
+except ValueError:
+    rel = Path(target_dir.name)
+qa_dir = repo_root / "qa" / str(rel).replace("/", "-")
 ```
 
 ---
 
-## Bug #10 — HIGH: Issue creation crashes workflow (issues disabled on repo)
+## Bug D — HIGH: `scan_all()` passes file paths to `process_directory()` in `normalize_manifest.py`
 
 ### Root Cause
-The "Open issue on failure" step calls `github.rest.issues.create()`. The `fond-reel-masters` repo has **issues disabled** (`has_issues: false`). GitHub returns a **410 Gone** response, which throws an unhandled exception in the `actions/github-script` runner.
+In `normalize_manifest.py::scan_all()`:
 
-Because the step had no `continue-on-error: true`, this crash **killed the entire workflow** before the final `Fail workflow` steps could run — swallowing the actual error message and making it impossible to see what really failed.
+```python
+for parent in ["ads-bridge", "masters"]:
+    p = root / parent
+    if p.exists():
+        for sub in p.iterdir():    # <-- iterdir() yields both files AND dirs
+            if sub.is_dir():       # <-- MISSING: this check was absent
+                dirs.append(sub)
+```
 
-Additionally, the `listForRepo` call for existing issues also returns 410 for disabled-issues repos, so the dedup check also threw.
+Wait — checking the current live code more carefully: the live code does **not** have `if sub.is_dir()` guard in the `masters`/`ads-bridge` loop. The loop is:
+
+```python
+for parent in ["ads-bridge", "masters"]:
+    p = root / parent
+    if p.exists():
+        for sub in p.iterdir():
+            dirs.append(sub)   # appends ALL entries, including files
+```
+
+`p.iterdir()` yields **all** entries — files and directories. When a file (e.g. `masters/README.md`) is appended to `dirs` and passed to `process_directory()`:
+
+1. `detect_schema(directory)` calls `directory / "manifest.json"` which becomes `masters/README.md/manifest.json` — a path that never exists
+2. Falls through to `create_empty_manifest(directory)`
+3. `directory.rglob("*")` on a **file path** raises `NotADirectoryError` in Python 3.11+
+
+This silently crashes the normaliser for any `masters/` or `ads-bridge/` parent that contains loose files (READMEs, `.gitignore`, etc.).
 
 ### Fix
-1. Add `continue-on-error: true` to the "Open issue on failure" step
-2. Wrap both `listForRepo` and `create` in a `try/catch` that logs a warning when issues are disabled, rather than throwing
+Add `if sub.is_dir():` guard:
+
+```python
+for parent in ["ads-bridge", "masters"]:
+    p = root / parent
+    if p.exists():
+        for sub in p.iterdir():
+            if sub.is_dir():       # FIX: skip files, only process directories
+                dirs.append(sub)
+```
 
 ---
 
-## Bug #11 — MEDIUM: Bare date directories never checked for missing manifests
+## Bug E — HIGH: Unguarded `grep` in CI "Detect changed directories" step
 
 ### Root Cause
-The missing-manifest check used the glob:
+In `.github/workflows/archive_integrity.yml`, the `Detect changed directories` step:
+
 ```bash
-for dir in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*/; do
+git diff --name-only HEAD~1 HEAD | \
+  grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' | \
+  sed 's|\([^/]*/[^/]*\)/.*|\1|' | sort -u > /tmp/changed_dirs.txt
+
+git diff --name-only HEAD~1 HEAD | \
+  grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}/' | \
+  cut -d/ -f1 | sort -u >> /tmp/changed_dirs.txt
 ```
 
-The trailing `-*` requires a **suffix after the date** (e.g. `2026-07-09-remaster/`). Plain date directories like `2026-07-09/` never match this glob.
+GitHub Actions runs shell steps with `set -eo pipefail` by default. `grep` exits with code **1** when it finds **no matches**. If a commit only touches top-level files (e.g. `README.md`, `requirements.txt`), the first `grep` finds no nested-dir changes and exits 1 — which, under `pipefail`, propagates and **aborts the entire step**.
 
-**Impact**: All bare date archive directories (which are the majority of the archive) were silently skipped during the missing-manifest check — they could have no manifest at all and CI would never detect it or auto-generate one.
+Result: `GITHUB_OUTPUT` never gets `scan_all=false` written, subsequent steps that read `steps.changed-dirs.outputs.scan_all` get an empty string, and the integrity check runs in an undefined state (the `[[ "" == "true" ]]` comparison evaluates to false, but `/tmp/changed_dirs.txt` was never created, so the `while IFS= read -r dir` loop errors with `No such file or directory`).
 
 ### Fix
-Add a second glob for bare date directories:
+Add `|| true` to each `grep` call to prevent non-zero exit on empty match:
+
 ```bash
-# Suffixed date dirs  (e.g. 2026-07-09-remaster/)
-for dir in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*/; do ...
-# Bare date dirs      (e.g. 2026-07-09/)
-for dir in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/; do ...
+git diff --name-only HEAD~1 HEAD | \
+  grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' || true | \
+  sed ...
+
+# Better: use process substitution to isolate grep exit code
+{ git diff --name-only HEAD~1 HEAD | grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' || true; } | \
+  sed 's|...' | sort -u > /tmp/changed_dirs.txt
+```
+
+Also ensure the file always exists:
+```bash
+touch /tmp/changed_dirs.txt
 ```
 
 ---
 
-## Bug #12 — MEDIUM: ads-bridge/ subdirectories never checked for missing manifests
+## Bug F — MEDIUM: RGB image + alpha fill → solid black overlay in contact sheet
 
 ### Root Cause
-The missing-manifest check only covered `masters/*/` and date-named directories. The `ads-bridge/*/` tree was completely omitted — ads-bridge archives could have no manifest and CI would never detect or auto-generate one.
+In `verify_protagonist.py::make_contact_sheet()`:
+
+```python
+img = Image.open(io.BytesIO(data)).convert("RGB")   # RGB mode
+...
+draw.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))  # 4-tuple: RGBA
+```
+
+PIL's `ImageDraw.rectangle()` with an RGBA fill tuple on an **RGB** image silently truncates the alpha channel and treats it as `fill=(0, 0, 0)` — a **solid black** rectangle. The intended semi-transparent overlay (alpha=180/255 ≈ 70% opaque) never appears; instead the label background is fully opaque black, obscuring frame content near the top of each thumbnail.
+
+This doesn't crash, but produces diagnostic contact sheets where the label blocks content, making face-drift diagnosis harder.
 
 ### Fix
-Add a dedicated check block for `ads-bridge/*/`:
-```bash
-for dir in ads-bridge/*/; do
-  if [ -d "$dir" ] && [ ! -f "${dir}manifest.json" ]; then
-    MISSING="$MISSING\n- $dir"
-  fi
-done
+Composite via RGBA then convert back to RGB:
+
+```python
+img = Image.open(io.BytesIO(data)).convert("RGBA")
+overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+draw_overlay = ImageDraw.Draw(overlay)
+draw_overlay.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))
+img = Image.alpha_composite(img, overlay).convert("RGB")
+draw = ImageDraw.Draw(img)
+draw.text((8, 6), label, fill=(255, 255, 255))
 ```
 
 ---
 
-## Impact Summary
+## Impact Assessment
 
-| Bug | Severity | Effect Before Fix |
-|-----|----------|-------------------|
-| #9 — Step ordering inversion | CRITICAL | 100% of CI runs fail even on clean pushes with missing-manifest-only issues |
-| #10 — Issues API crash | HIGH | Workflow dies silently before emitting the real error; actual failure reason swallowed |
-| #11 — Bare date dir glob miss | MEDIUM | All plain date archives skip manifest check; missing manifests go undetected indefinitely |
-| #12 — ads-bridge omitted | MEDIUM | All ads-bridge archives skip manifest check; missing manifests go undetected indefinitely |
-
----
-
-## Files Changed
-
-- `.github/workflows/archive_integrity.yml` — step reorder, `continue-on-error`, glob fixes, try/catch in JS
+| Bug | When triggered | Impact |
+|-----|---------------|--------|
+| C | CI checks 2+ `masters/YYYY-MM-DD-*` dirs in one run | Protagonist reports silently overwritten; failing reel may appear to pass if last dir wins |
+| D | `normalize_manifest.py --all` on any repo with loose files in `masters/` or `ads-bridge/` | `NotADirectoryError` crash; normaliser exits early, leaving manifests un-migrated |
+| E | Push/PR that only changes root-level files | CI step aborts; changed_dirs output missing; subsequent integrity job has undefined behavior |
+| F | Contact sheet generation with PIL | Diagnostic images have solid-black label bar instead of semi-transparent; harder to review |
 
 ---
 
-## Verification
+## Follow-on Recommendations
 
-After this fix, a push that triggers the workflow on a directory with no manifest should:
-1. Detect missing manifest
-2. Auto-generate it (`normalize_manifest.py --all --write`)
-3. Commit and push the manifest
-4. Run integrity check → sees generated manifest → ✅ passes (unverified SHA, but not a hard failure)
-5. Run protagonist check
-6. Workflow completes green
-
-A push with a genuine SHA256 mismatch or part-count error should still fail at step 4 (after auto-gen), surfacing the real error.
+1. **Regression fixtures:** Add a CI test that pushes a root-only file change (e.g. `requirements.txt` bump) and verifies the `Detect changed directories` step completes without error.
+2. **`qa_dir` uniqueness:** Adopt the `str(rel).replace("/", "-")` pattern consistently in both `verify_integrity.py` and `verify_protagonist.py` — already done in this fix batch.
+3. **File-guard pattern:** All `iterdir()` loops that expect directories should always include `if sub.is_dir()`. Add a lint rule or comment to enforce this.
+4. **RGBA contact sheets:** Consider storing contact sheet thumbnails at higher quality (JPEG q=90) and with resolution 480×720 for better face-drift visibility.
