@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-verify_integrity.py – Unified archive integrity verifier for fond-reel-masters.
+verify_integrity.py — Unified archive integrity verifier for fond-reel-masters.
 
 Fixes:
   Bug #1 (CRITICAL): manifest_missing not counted in exit code → silent CI pass
   Bug #2 (HIGH): QA report collision when same-named dirs exist under different parents
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
 
+  Bug I (LOW): sha256_of_bytes(data: bytes) was defined but never called anywhere.
+  All hashing uses sha256_of_parts() (streaming, multi-file). The dead function
+  caused confusion about which hashing strategy was canonical and risked accidental
+  misuse by future contributors. Removed entirely.
+
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
-    python tools/verify_integrity.py --all           # scan entire repo
-    python tools/verify_integrity.py --dry-run       # report only, no writes
+    python tools/verify_integrity.py --all          # scan entire repo
+    python tools/verify_integrity.py --dry-run      # report only, no writes
 """
 
 import argparse
@@ -28,8 +33,8 @@ PART_RE = re.compile(r"^(.+)\.p(\d{2})of(\d{2})$")
 CHUNK_SIZE = 65536  # 64 KB read buffer
 
 
-def sha256_of_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# sha256_of_bytes removed (Bug I fix): it was defined but never called.
+# All hashing is done via sha256_of_parts() below.
 
 
 def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
@@ -135,7 +140,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
 
     for key in manifest_keys - parts_keys:
         report["orphaned_manifest_entries"].append(key)
-        print(f"  ❌ ORPHANED: {key} is in manifest but has no files on disk")
+        print(f"  ✘ ORPHANED: {key} is in manifest but has no files on disk")
 
     for key in parts_keys - manifest_keys:
         digest, total_bytes = sha256_of_parts(parts_map[key])
@@ -158,7 +163,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
                 "expected": expected_parts,
                 "found": len(part_files),
             })
-            print(f"  ❌ MISSING PARTS: {key}: expected {expected_parts}, found {len(part_files)}")
+            print(f"  ✘ MISSING PARTS: {key}: expected {expected_parts}, found {len(part_files)}")
             continue
 
         digest, total_bytes = sha256_of_parts(part_files)
@@ -174,19 +179,19 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
                 "expected": expected_sha,
                 "actual": digest,
             })
-            print(f"  ❌ SHA256 MISMATCH: {key}")
+            print(f"  ✘ SHA256 MISMATCH: {key}")
         elif not size_ok:
             report["size_mismatch"].append({
                 "asset": key,
                 "expected_bytes": expected_bytes,
                 "actual_bytes": total_bytes,
             })
-            print(f"  ❌ SIZE MISMATCH: {key} expected {expected_bytes}B got {total_bytes}B")
+            print(f"  ✘ SIZE MISMATCH: {key} expected {expected_bytes}B got {total_bytes}B")
         else:
             actually_verified = bool(expected_sha) or bool(expected_bytes)
             if actually_verified:
                 report["ok"].append(key)
-                print(f"  ✅ OK: {key} ({total_bytes:,} bytes, SHA256 verified)")
+                print(f"  ✔ OK: {key} ({total_bytes:,} bytes, SHA256 verified)")
             else:
                 report["unverified"].append(key)
                 print(f"  ⚠️  UNVERIFIED: {key} – no SHA256 or size in manifest")
@@ -269,7 +274,7 @@ def main():
         sys.exit(1 if n_fail else 0)
     elif args.all:
         failures = scan_repo(root, dry_run=args.dry_run)
-        print(f"\n{'✅ All checks passed.' if failures == 0 else f'❌ {failures} failure(s) found.'}")
+        print(f"\n{'✔ All checks passed.' if failures == 0 else f'✘ {failures} failure(s) found.'}")
         sys.exit(1 if failures else 0)
     else:
         parser.print_help()

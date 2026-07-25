@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-normalize_manifest.py – Manifest schema normalizer for fond-reel-masters.
+normalize_manifest.py — Manifest schema normalizer for fond-reel-masters.
 
 Fixes (historical):
   Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
-                 Python's all() returning True over an empty iterable (vacuous truth).
+               Python's all() returning True over an empty iterable (vacuous truth).
 
 Fixes (2026-07-26):
   Bug D (HIGH): scan_all() iterated over p.iterdir() for ads-bridge/ and masters/
@@ -13,6 +13,13 @@ Fixes (2026-07-26):
                 process_directory(), which called directory.rglob("*") on a file
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
+
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_* directories,
+                missing bare part_0/part_1/... naming convention (common in
+                2026-07-09 era reels). Emitted manifests had parts_detail:[] and
+                parts:0, causing verify_integrity.py to flag MISSING PARTS /
+                UNTRACKED on every CI run.
+                Fix: glob both master_part_* and part_*, deduplicate by filename.
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -34,9 +41,9 @@ SCHEMA_VERSION = 2
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # Schema detection
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     """
@@ -56,7 +63,7 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
         if "date" in data and "arm" in data and isinstance(data.get("parts"), int):
             return 1, data  # 1a
         # Ads-bridge manifest: values are dicts with sha256/bytes/parts
-        # FIX Bug #3: guard against empty JSON {} – all() over empty iterable
+        # FIX Bug #3: guard against empty JSON {} — all() over empty iterable
         # returns True (vacuous truth), causing {} to be misdetected as schema 1b.
         if data and all(isinstance(v, dict) for v in data.values()):
             return 11, data  # 1b
@@ -71,13 +78,22 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     return 0, None  # missing
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # Normalisation functions
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    # FIX Bug H: glob both master_part_* and part_*, deduplicate by filename, sort.
+    # Previously only globbed master_part_*, missing bare part_0/part_1/... naming
+    # (common in 2026-07-09 era). This caused parts_detail to be empty and parts:0
+    # to be emitted, triggering MISSING PARTS / UNTRACKED failures in verify_integrity.
+    part_files = sorted(
+        {f.name: f for f in (
+            list(directory.glob("master_part_*")) +
+            list(directory.glob("part_*"))
+        )}.values()
+    )
     parts_info = []
     for pf in part_files:
         parts_info.append({
@@ -168,9 +184,9 @@ def create_empty_manifest(directory: Path) -> Dict:
     }
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # Main scan
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 def process_directory(directory: Path, write: bool = False) -> bool:
     """
@@ -180,7 +196,7 @@ def process_directory(directory: Path, write: bool = False) -> bool:
     schema, raw = detect_schema(directory)
 
     if schema == 2:
-        print(f"  ✅ {directory.name}: already schema v2, skipping")
+        print(f"  ✔ {directory.name}: already schema v2, skipping")
         return False
 
     if schema == 0:
@@ -242,7 +258,7 @@ def scan_all(root: Path, write: bool = False) -> int:
                     dirs.append(sub)
 
     for d in sorted(dirs):
-        print(f"\n📁 {d.relative_to(root)}")
+        print(f"\n\U0001f4c1 {d.relative_to(root)}")
         changed = process_directory(d, write=write)
         if changed:
             count += 1
@@ -261,17 +277,17 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("👁 DRY RUN – pass --write to apply changes\n")
+        print("\U0001f481 DRY RUN – pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
         process_directory(d, write=args.write)
     elif args.all:
         n = scan_all(root, write=args.write)
-        print(f"\n{'✅' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
+        print(f"\n{'✔' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
     else:
         n = scan_all(root, write=args.write)
-        print(f"\n{'✅' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
+        print(f"\n{'✔' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
 
 
 if __name__ == "__main__":
