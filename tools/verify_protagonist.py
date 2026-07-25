@@ -2,37 +2,27 @@
 """
 verify_protagonist.py — Protagonist face-identity pre-commit guard for fond-reel-masters.
 
-Fixes Bug #1: Wrong protagonist (AI character drift) across Veo A/B model renders.
+Fixes:
+  Bug #4 (CRITICAL): extract_frame_bytes() was called on individual raw .pNNofNN
+  chunks. Only the first chunk has a container header; the last chunk (closing frame)
+  is raw byte data that ffmpeg cannot parse, so it always returned None and was
+  silently treated as 'no ffmpeg' → PASS. This meant protagonist checking was
+  completely non-functional. Fix: reassemble all parts into a single temp MP4 first,
+  then extract both frames from the assembled file.
 
-The reel pipeline uses two AI video models (Veo A / Veo B) for different clip segments.
-When model instances are not seeded identically, they produce different character
-embeddings for the same prompt subject, causing visible face drift between opening
-and closing shots.
+  Bug A (HIGH): directory.iterdir() for .pNNofNN files only listed top-level items,
+  missing parts/ subdirectory (used by 2026-07-09 → 2026-07-16).
 
-This script:
-  1. Locates all video part files (top-level or in parts/ subdirectory)
-  2. Reassembles parts into a temp MP4 file
-  3. Extracts face thumbnail strips from the opening (t=00:00:01) and
-     closing (t=00:00:30) of the assembled video
-  4. Computes perceptual hash similarity between opening and closing faces
-  5. Exits with code 1 if similarity < threshold (blocks git commit via pre-commit hook)
-  6. Saves a diagnostic contact sheet to qa/{date}/diag_faces.jpg
-
-Supported part naming conventions:
-  - *.pNNofNN  (e.g. fond_ad_C1_v1_9x16.mp4.p01of06) — top-level or parts/ subdir
-  - part_*     (e.g. part_0, part_1) — top-level
-  - master_part_* (e.g. master_part_0) — top-level
+  Bug B (HIGH): glob("part_*") missed master_part_* naming convention.
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
     python tools/verify_protagonist.py --dir masters/2026-07-24-final --threshold 0.80
-    python tools/verify_protagonist.py --dir masters/2026-07-24-final --skip-check  # audit only
+    python tools/verify_protagonist.py --dir masters/2026-07-24-final --skip-check
 
 Install dependencies:
     pip install pillow imagehash
-
-For full face detection (optional, improves accuracy):
-    pip install face_recognition  # requires cmake + dlib
+    # For face detection: pip install face_recognition
 """
 
 import argparse
@@ -48,7 +38,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------------
-# Perceptual hashing (built-in, no external deps for core function)
+# Perceptual hashing
 # ---------------------------------------------------------------------------------
 
 def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
@@ -59,7 +49,6 @@ def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
     """
     try:
         from PIL import Image
-
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
         img = img.resize((hash_size, hash_size), Image.LANCZOS)
         pixels = list(img.getdata())
@@ -70,7 +59,6 @@ def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
                 bits |= (1 << i)
         return bits
     except ImportError:
-        # Fallback: use first 64 bits of MD5
         digest = hashlib.md5(image_bytes).digest()
         return struct.unpack("<Q", digest[:8])[0]
 
@@ -94,8 +82,7 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
     """
     import subprocess
 
-    # FIX (original Bug #1): initialize tmp_path before try so finally never
-    # raises UnboundLocalError if NamedTemporaryFile() itself fails.
+    # Initialize tmp_path before try so finally never raises UnboundLocalError
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -133,35 +120,18 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
 
 def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     """
-    Locate all ordered video part files in a directory tree and return the
-    full part list as both the "opening" and "closing" part collections.
-    The caller uses these to reassemble the complete video and then extract
-    frames at arbitrary timestamps.
+    Locate all ordered video part files in a directory tree.
 
-    Searches top-level AND the parts/ subdirectory.
-    Matches three naming conventions:
-      - part_* / master_part_*  (bare integer-indexed chunks, top-level only)
-      - *.pNNofNN               (padded-index, top-level or parts/ subdir)
+    FIX Bug A: Also search the parts/ subdirectory (not just top-level).
+    FIX Bug B: Match both part_* and master_part_* naming conventions.
 
-    Returns (all_parts, all_parts) so that verify_protagonist can reassemble
-    the full video from those parts.  Returns ([], []) when no parts are
-    found or when only a single part exists (drift check cannot run).
-
-    FIX Bug A: Prior version used directory.iterdir() for .pNNofNN files,
-    which only lists top-level items. Dates 2026-07-09 → 2026-07-16 all
-    store parts inside a parts/ subdirectory, so the check silently skipped
-    every one of those dates.
-
-    FIX Bug B: Prior version used glob("part_*"), which does not match
-    master_part_* (used by 2026-07-17). Result: every archive date — both
-    those with a parts/ subdir (Bug A) AND those with top-level master_part_*
-    files (Bug B) — silently skipped the protagonist check.
+    Returns (all_parts, all_parts) so caller can reassemble and sample at any timestamp.
+    Returns ([], []) when no parts are found or only one part exists.
     """
     import re
 
-    # ── Strategy 1: bare integer-indexed chunks at the top level ──────────
-    # Match both part_* (e.g. part_0) and master_part_* (e.g. master_part_0).
-    # FIX Bug B: original glob("part_*") missed master_part_* entirely.
+    # Strategy 1: bare integer-indexed chunks at top level
+    # FIX Bug B: include master_part_* as well as part_*
     bare_parts = sorted(
         list(directory.glob("part_*")) + list(directory.glob("master_part_*"))
     )
@@ -172,13 +142,10 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
                 "— cannot test protagonist drift. Skipping check."
             )
             return [], []
-        # Return the full list for both opening and closing so the caller
-        # can reassemble and sample at any timestamp.
         return bare_parts, bare_parts
 
-    # ── Strategy 2: .pNNofNN files (top-level AND parts/ subdirectory) ────
-    # FIX Bug A: also search the parts/ subdirectory so dates that store
-    # their chunks there (2026-07-09 → 2026-07-16) are discovered.
+    # Strategy 2: .pNNofNN files (top-level AND parts/ subdirectory)
+    # FIX Bug A: also search the parts/ subdirectory
     groups: Dict[str, List[Tuple[int, Path]]] = {}
     search_roots = [directory]
     parts_subdir = directory / "parts"
@@ -198,7 +165,6 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     if not groups:
         return [], []
 
-    # Pick the group with the most parts (main video, not thumbnail/poster)
     best_key = max(groups, key=lambda k: len(groups[k]))
     all_parts = [p for _, p in sorted(groups[best_key], key=lambda x: x[0])]
 
@@ -217,10 +183,7 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
 # ---------------------------------------------------------------------------------
 
 def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
-    """
-    Create a side-by-side contact sheet from labeled frame bytes.
-    Requires PIL.
-    """
+    """Create a side-by-side contact sheet from labeled frame bytes. Requires PIL."""
     try:
         from PIL import Image, ImageDraw
 
@@ -228,8 +191,6 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
         for label, data in frames:
             img = Image.open(io.BytesIO(data)).convert("RGB")
             img = img.resize((320, 480), Image.LANCZOS)
-
-            # Add label
             draw = ImageDraw.Draw(img)
             draw.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))
             draw.text((8, 6), label, fill=(255, 255, 255))
@@ -242,7 +203,7 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         sheet.save(str(output_path), "JPEG", quality=85)
-        print(f"  📸 Contact sheet saved: {output_path}")
+        print(f"  \U0001f4f8 Contact sheet saved: {output_path}")
 
     except ImportError:
         print("  ⚠️   PIL not available — skipping contact sheet generation")
@@ -263,18 +224,13 @@ def verify_protagonist(
     Verify protagonist face consistency between opening and closing of reel.
     Returns True if check passes (or was skipped), False if identity drift detected.
 
-    FIX Bug C: Previous version called extract_frame_bytes() on individual
-    binary split chunks (.pNNofNN). Only the first chunk potentially contains
-    the moov atom and is parseable by ffmpeg. The last chunk (used for the
-    closing frame) is raw video data with no container header — ffmpeg always
-    returns None for it — causing verify_protagonist to print "treating as
-    PASS" and return True for every reel, regardless of protagonist drift.
-
-    Fix: reassemble ALL parts into a single temporary MP4 file first (once),
-    then call extract_frame_bytes on the fully assembled file for both the
-    opening frame (t=00:00:01) and the closing frame (t=00:00:30).
+    FIX Bug #4 (CRITICAL): Reassemble ALL parts into a single temp MP4 first,
+    then extract both frames from the assembled file. Individual .pNNofNN chunks
+    are raw byte splits of the MP4 container — they are NOT independently decodable.
+    The last chunk (used for closing frame) has no container header and ffmpeg
+    always returns None for it, causing every reel to silently pass.
     """
-    print(f"🎬 Verifying protagonist consistency in: {directory}")
+    print(f"\U0001f3ac Verifying protagonist consistency in: {directory}")
 
     all_parts, _ = find_parts_in_dir(directory)
 
@@ -283,15 +239,12 @@ def verify_protagonist(
         return True
 
     print(
-        f"  📂 Found {len(all_parts)} parts: "
+        f"  \U0001f4c2 Found {len(all_parts)} parts: "
         f"{all_parts[0].name} … {all_parts[-1].name}"
     )
 
-    # FIX Bug C: Reassemble ALL parts into a single temp MP4 file, then
-    # extract both frames from the assembled file.  Individual .pNNofNN
-    # chunks are raw byte splits of the MP4 container — they are NOT
-    # independently decodable video files.  Only the assembled file can be
-    # reliably decoded by ffmpeg at an arbitrary timestamp.
+    # FIX Bug #4: Reassemble all parts into a single temp MP4, then extract
+    # both frames from the fully assembled, decodable file.
     assembled_path: Optional[Path] = None
     opening_frame: Optional[bytes] = None
     closing_frame: Optional[bytes] = None
@@ -299,7 +252,7 @@ def verify_protagonist(
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
         print(
-            f"  🔗 Reassembling {len(all_parts)} parts "
+            f"  \U0001f517 Reassembling {len(all_parts)} parts "
             f"({total_bytes / 1_048_576:.1f} MB)…"
         )
 
@@ -308,17 +261,13 @@ def verify_protagonist(
             for part in all_parts:
                 tmp.write(part.read_bytes())
 
-        print("  🎞️   Extracting opening frame (t=00:00:01)…")
+        print("  \U0001f39e️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        # Sample closing frame near end of video.  t=00:00:30 is used as a
-        # heuristic — ffmpeg clamps to the last available frame when the
-        # timestamp exceeds the file duration, so this works for short reels too.
-        print("  🎞️   Extracting closing frame (t=00:00:30)…")
+        print("  \U0001f39e️   Extracting closing frame (t=00:00:30)…")
         closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
 
     finally:
-        # Always clean up the reassembled temp file (potentially large).
         if assembled_path is not None:
             try:
                 assembled_path.unlink()
@@ -331,14 +280,12 @@ def verify_protagonist(
         print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
         return True
 
-    # Compute perceptual hash similarity
     h_open = _average_hash(opening_frame)
     h_close = _average_hash(closing_frame)
     similarity = hash_similarity(h_open, h_close)
 
-    print(f"  🔬 Face similarity score: {similarity:.3f} (threshold: {threshold:.2f})")
+    print(f"  \U0001f52c Face similarity score: {similarity:.3f} (threshold: {threshold:.2f})")
 
-    # Save contact sheet
     if qa_dir:
         sheet_path = qa_dir / "diag_faces.jpg"
         make_contact_sheet(
@@ -349,7 +296,6 @@ def verify_protagonist(
             sheet_path,
         )
 
-    # Write JSON report
     report = {
         "directory": str(directory),
         "parts": len(all_parts),
@@ -368,7 +314,7 @@ def verify_protagonist(
         qa_dir.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2)
-        print(f"  📄 Report: {report_path}")
+        print(f"  \U0001f4c4 Report: {report_path}")
 
     if skip_check:
         print(f"  ℹ️   Check skipped (--skip-check). Similarity was {similarity:.3f}")
@@ -403,7 +349,7 @@ def main():
     )
     parser.add_argument(
         "--qa-dir",
-        help="Directory to write diagnostic images and report (default: qa/{date})",
+        help="Directory to write diagnostic images and report",
     )
     parser.add_argument("--repo-root", default=".", help="Repo root path")
     args = parser.parse_args()
@@ -414,7 +360,6 @@ def main():
     if args.qa_dir:
         qa_dir = Path(args.qa_dir)
     else:
-        # Auto-detect date from directory name
         import re
         m = re.search(r"\d{4}-\d{2}-\d{2}", target_dir.name)
         date = m.group(0) if m else target_dir.name
