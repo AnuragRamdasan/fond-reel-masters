@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-normalize_manifest.py — Manifest schema normalizer for fond-reel-masters.
+normalize_manifest.py – Manifest schema normalizer for fond-reel-masters.
 
 Fixes Bug #2: Inconsistent manifest schema across archive dates.
 
@@ -31,9 +31,9 @@ SCHEMA_VERSION = 2
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Schema detection
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     """
@@ -53,8 +53,10 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
         if "date" in data and "arm" in data and isinstance(data.get("parts"), int):
             return 1, data  # 1a
         # Ads-bridge manifest: values are dicts with sha256/bytes/parts
-        if all(isinstance(v, dict) for v in data.values()):
-            return 11, data  # 1b (using 11 to distinguish)
+        # FIX Bug #3: guard against empty JSON {} – all() over empty iterable
+        # returns True (vacuous truth), causing {} to be misdetected as schema 1b.
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return 11, data  # 1b
         return 1, data
 
     for txt_path in [sha256_txt, sha256_txt2]:
@@ -66,9 +68,9 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     return 0, None  # missing
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Normalisation functions
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
@@ -169,9 +171,9 @@ def create_empty_manifest(directory: Path) -> Dict:
     }
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main scan
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def process_directory(directory: Path, write: bool = False) -> bool:
     """
@@ -201,7 +203,7 @@ def process_directory(directory: Path, write: bool = False) -> bool:
         return False
 
     out_path = directory / "manifest.json"
-    print(f"  {'📝' if write else '🔍'} {directory.name}: {action}")
+    print(f"  {'📝' if write else '👁'} {directory.name}: {action}")
 
     if write:
         # Back up old manifest if it exists
@@ -259,18 +261,18 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("🔍 DRY RUN — pass --write to apply changes\n")
+        print("👁 DRY RUN – pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
         process_directory(d, write=args.write)
     elif args.all:
         n = scan_all(root, write=args.write)
-        print(f"\n{'✅' if n else '—'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
+        print(f"\n{'✅' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
     else:
         # Default: scan all
         n = scan_all(root, write=args.write)
-        print(f"\n{'✅' if n else '—'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
+        print(f"\n{'✅' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
 
 
 if __name__ == "__main__":
