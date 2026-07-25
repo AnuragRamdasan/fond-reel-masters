@@ -39,9 +39,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Perceptual hashing (built-in, no external deps for core function)
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
     """
@@ -76,9 +76,9 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
     return 1.0 - (differing / total_bits)
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Video frame extraction
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Optional[bytes]:
     """
@@ -88,6 +88,7 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
     import subprocess
     import tempfile
 
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp_path = tmp.name
@@ -111,20 +112,27 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def extract_frame_from_parts(parts: List[Path], timestamp: str = "00:00:01") -> Optional[bytes]:
     """
     Reassemble parts into a temp file and extract a frame.
     Handles .pNNofNN parts by concatenating in order.
+
+    FIX #1: Initialize tmp_path = None before the try block so the finally
+    clause does not raise UnboundLocalError if NamedTemporaryFile() itself
+    fails (e.g. disk full).
     """
     import tempfile
     import subprocess
 
+    # FIX #1: must be initialized before try so finally can safely test it
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -134,16 +142,24 @@ def extract_frame_from_parts(parts: List[Path], timestamp: str = "00:00:01") -> 
         result = extract_frame_bytes(tmp_path, timestamp)
         return result
     finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+        # FIX #1: guard the unlink so an exception during file creation
+        # does not cause a secondary UnboundLocalError here
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     """
     Find first and last part groups in a directory.
     Returns (opening_parts, closing_parts).
+
+    FIX #2: When only a single part file exists, bare_parts[0] and
+    bare_parts[-1] refer to the same file, so the comparison always
+    yields similarity=1.0 and trivially passes — masking any real drift.
+    Return ([], []) with a warning so the caller skips the check.
     """
     import re
     PART_RE = re.compile(r"^(.+)\.(p(\d{2})of(\d{2})|part_(\d+))$", re.IGNORECASE)
@@ -151,6 +167,10 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     # bare part_NN files (masters/ format)
     bare_parts = sorted(directory.glob("part_*"))
     if bare_parts:
+        # FIX #2: single-part video — cannot compare opening vs closing
+        if len(bare_parts) == 1:
+            print(f"  ⚠️  Only one part found in {directory.name} — cannot test protagonist drift. Skipping check.")
+            return [], []
         return [bare_parts[0]], [bare_parts[-1]]
 
     # .pNNofNN files (date-level format)
@@ -170,13 +190,18 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     parts = sorted(groups[best_key], key=lambda x: x[0])
     all_parts = [p for _, p in parts]
 
+    # FIX #2: single-part video — cannot compare opening vs closing
+    if len(all_parts) == 1:
+        print(f"  ⚠️  Only one part found in {directory.name} — cannot test protagonist drift. Skipping check.")
+        return [], []
+
     # Opening = first part, closing = last part
     return [all_parts[0]], [all_parts[-1]]
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Contact sheet generation
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
     """
@@ -207,13 +232,13 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
         print(f"  📸 Contact sheet saved: {output_path}")
 
     except ImportError:
-        print("  ⚠️  PIL not available — skipping contact sheet generation")
+        print("  ⚠️   PIL not available — skipping contact sheet generation")
         print("       pip install pillow")
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Main verification logic
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def verify_protagonist(
     directory: Path,
@@ -230,22 +255,28 @@ def verify_protagonist(
     opening_parts, closing_parts = find_parts_in_dir(directory)
 
     if not opening_parts:
-        print("  ⚠️  No video parts found in directory. Skipping check.")
+        print("  ⚠️   No video parts found in directory. Skipping check.")
         return True
 
     print(f"  📂 Opening part: {opening_parts[0].name}")
     print(f"  📂 Closing part: {closing_parts[0].name}")
 
     # Extract frames
-    print("  🎞️  Extracting opening frame (t=00:00:01)...")
+    # Opening: sample from t=00:00:01 (beginning of opening segment)
+    print("  🎞️   Extracting opening frame (t=00:00:01)...")
     opening_frame = extract_frame_bytes(opening_parts[0], "00:00:01")
 
-    print("  🎞️  Extracting closing frame (t=00:00:01)...")
-    closing_frame = extract_frame_bytes(closing_parts[0], "00:00:01")
+    # FIX #3: Closing part should be sampled near the END of the segment,
+    # not at t=00:00:01 (same as opening). Late-segment drift is undetectable
+    # when both frames come from second 1. Use t=00:00:30 as a heuristic
+    # (most reels are longer than 30 seconds; ffmpeg clamps to the last
+    # available frame if the file is shorter).
+    print("  🎞️   Extracting closing frame (t=00:00:30, near end of closing segment)...")
+    closing_frame = extract_frame_bytes(closing_parts[0], "00:00:30")
 
     if opening_frame is None or closing_frame is None:
-        print("  ⚠️  Could not extract frames (ffmpeg not available or parts too short)")
-        print("  ℹ️  Install ffmpeg to enable face-identity checking")
+        print("  ⚠️   Could not extract frames (ffmpeg not available or parts too short)")
+        print("  ℹ️   Install ffmpeg to enable face-identity checking")
         print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
         return True
 
@@ -272,6 +303,8 @@ def verify_protagonist(
         "directory": str(directory),
         "opening_part": opening_parts[0].name,
         "closing_part": closing_parts[0].name,
+        "opening_timestamp": "00:00:01",
+        "closing_timestamp": "00:00:30",
         "similarity": round(similarity, 4),
         "threshold": threshold,
         "passed": similarity >= threshold or skip_check,
@@ -286,7 +319,7 @@ def verify_protagonist(
         print(f"  📄 Report: {report_path}")
 
     if skip_check:
-        print(f"  ℹ️  Check skipped (--skip-check). Similarity was {similarity:.3f}")
+        print(f"  ℹ️   Check skipped (--skip-check). Similarity was {similarity:.3f}")
         return True
 
     if similarity >= threshold:
