@@ -8,7 +8,7 @@ Fixes:
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
-    python tools/verify_integrity.py --all          # scan entire repo
+    python tools/verify_integrity.py --all           # scan entire repo
     python tools/verify_integrity.py --dry-run      # report only, no writes
 """
 
@@ -74,9 +74,9 @@ def collect_parts(directory: Path) -> Dict[str, List[Path]]:
         expected_total = entries[0][1]
         # Validate all parts agree on total count
         if any(e[1] != expected_total for e in entries):
-            print(f"  ⚠️  WARN: inconsistent total-part count in {logical_name}")
+            print(f"  ⚠️   WARN: inconsistent total-part count in {logical_name}")
         if len(entries) != expected_total:
-            print(f"  ⚠️  WARN: expected {expected_total} parts for {logical_name}, found {len(entries)}")
+            print(f"  ⚠️   WARN: expected {expected_total} parts for {logical_name}, found {len(entries)}")
         result[logical_name] = [e[2] for e in entries]
     return result
 
@@ -98,6 +98,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
     report = {
         "directory": str(directory),
         "ok": [],
+        "unverified": [],          # FIX #5: new list for entries with no SHA/size in manifest
         "missing_parts": [],
         "sha256_mismatch": [],
         "size_mismatch": [],
@@ -111,7 +112,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
 
     if manifest is None:
         report["manifest_missing"] = True
-        print(f"  ⚠️  No manifest.json in {directory}")
+        print(f"  ⚠️   No manifest.json in {directory}")
         # Still check parts exist and compute their hashes
         for logical_name, part_files in parts_map.items():
             digest, total_bytes = sha256_of_parts(part_files)
@@ -159,7 +160,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             "bytes": total_bytes,
             "sha256": digest,
         })
-        print(f"  ⚠️  UNTRACKED: {key} has no manifest entry")
+        print(f"  ⚠️   UNTRACKED: {key} has no manifest entry")
 
     # Verify files that appear in both
     for key in manifest_keys & parts_keys:
@@ -200,8 +201,17 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             })
             print(f"  ❌ SIZE MISMATCH: {key} expected {expected_bytes}B got {total_bytes}B")
         else:
-            report["ok"].append(key)
-            print(f"  ✅ OK: {key} ({total_bytes:,} bytes, SHA256 verified)")
+            # FIX #5: only mark OK if something was actually verified against
+            # manifest data. If both expected_sha and expected_bytes are absent
+            # (empty string / 0), the file has not been verified against anything
+            # and should be flagged as unverified rather than silently OK'd.
+            actually_verified = bool(expected_sha) or bool(expected_bytes)
+            if actually_verified:
+                report["ok"].append(key)
+                print(f"  ✅ OK: {key} ({total_bytes:,} bytes, SHA256 verified)")
+            else:
+                report["unverified"].append(key)
+                print(f"  ⚠️  UNVERIFIED: {key} — no SHA256 or size in manifest")
 
     return report
 
@@ -241,7 +251,13 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
         failures += n_fail
 
         if not dry_run:
-            qa_dir = root / "qa" / d.name.replace("/", "-")
+            # FIX #4: d.name only gives the final path component (no slashes),
+            # so .replace('/', '-') was a no-op. Two subdirs under different
+            # parents (e.g. ads-bridge/2026-07-11 and masters/2026-07-11)
+            # both have d.name == '2026-07-11' and would overwrite each other's
+            # QA report. Use relative_to(root) to get the full relative path
+            # and produce unique names like 'ads-bridge-2026-07-11'.
+            qa_dir = root / "qa" / str(d.relative_to(root)).replace("/", "-")
             write_report(report, qa_dir)
 
     return failures
