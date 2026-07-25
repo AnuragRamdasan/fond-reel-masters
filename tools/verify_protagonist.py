@@ -10,10 +10,18 @@ embeddings for the same prompt subject, causing visible face drift between openi
 and closing shots.
 
 This script:
-  1. Extracts face thumbnail strips from the first and last video parts
-  2. Computes perceptual hash similarity between opening and closing faces
-  3. Exits with code 1 if similarity < threshold (blocks git commit via pre-commit hook)
-  4. Saves a diagnostic contact sheet to qa/{date}/diag_faces.jpg
+  1. Locates all video part files (top-level or in parts/ subdirectory)
+  2. Reassembles parts into a temp MP4 file
+  3. Extracts face thumbnail strips from the opening (t=00:00:01) and
+     closing (t=00:00:30) of the assembled video
+  4. Computes perceptual hash similarity between opening and closing faces
+  5. Exits with code 1 if similarity < threshold (blocks git commit via pre-commit hook)
+  6. Saves a diagnostic contact sheet to qa/{date}/diag_faces.jpg
+
+Supported part naming conventions:
+  - *.pNNofNN  (e.g. fond_ad_C1_v1_9x16.mp4.p01of06) — top-level or parts/ subdir
+  - part_*     (e.g. part_0, part_1) — top-level
+  - master_part_* (e.g. master_part_0) — top-level
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
@@ -34,9 +42,9 @@ import json
 import os
 import struct
 import sys
-import zlib
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------------
@@ -51,7 +59,6 @@ def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
     """
     try:
         from PIL import Image
-        import math
 
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
         img = img.resize((hash_size, hash_size), Image.LANCZOS)
@@ -83,11 +90,12 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
 def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Optional[bytes]:
     """
     Extract a single frame from a video file using ffmpeg.
-    Returns JPEG bytes, or None if ffmpeg is not available.
+    Returns JPEG bytes, or None if ffmpeg is not available / extraction fails.
     """
     import subprocess
-    import tempfile
 
+    # FIX (original Bug #1): initialize tmp_path before try so finally never
+    # raises UnboundLocalError if NamedTemporaryFile() itself fails.
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -119,84 +127,89 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
                 pass
 
 
-def extract_frame_from_parts(parts: List[Path], timestamp: str = "00:00:01") -> Optional[bytes]:
-    """
-    Reassemble parts into a temp file and extract a frame.
-    Handles .pNNofNN parts by concatenating in order.
-
-    FIX #1: Initialize tmp_path = None before the try block so the finally
-    clause does not raise UnboundLocalError if NamedTemporaryFile() itself
-    fails (e.g. disk full).
-    """
-    import tempfile
-    import subprocess
-
-    # FIX #1: must be initialized before try so finally can safely test it
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            for part in parts:
-                tmp.write(part.read_bytes())
-
-        result = extract_frame_bytes(tmp_path, timestamp)
-        return result
-    finally:
-        # FIX #1: guard the unlink so an exception during file creation
-        # does not cause a secondary UnboundLocalError here
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-
+# ---------------------------------------------------------------------------------
+# Part discovery
+# ---------------------------------------------------------------------------------
 
 def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     """
-    Find first and last part groups in a directory.
-    Returns (opening_parts, closing_parts).
+    Locate all ordered video part files in a directory tree and return the
+    full part list as both the "opening" and "closing" part collections.
+    The caller uses these to reassemble the complete video and then extract
+    frames at arbitrary timestamps.
 
-    FIX #2: When only a single part file exists, bare_parts[0] and
-    bare_parts[-1] refer to the same file, so the comparison always
-    yields similarity=1.0 and trivially passes — masking any real drift.
-    Return ([], []) with a warning so the caller skips the check.
+    Searches top-level AND the parts/ subdirectory.
+    Matches three naming conventions:
+      - part_* / master_part_*  (bare integer-indexed chunks, top-level only)
+      - *.pNNofNN               (padded-index, top-level or parts/ subdir)
+
+    Returns (all_parts, all_parts) so that verify_protagonist can reassemble
+    the full video from those parts.  Returns ([], []) when no parts are
+    found or when only a single part exists (drift check cannot run).
+
+    FIX Bug A: Prior version used directory.iterdir() for .pNNofNN files,
+    which only lists top-level items. Dates 2026-07-09 → 2026-07-16 all
+    store parts inside a parts/ subdirectory, so the check silently skipped
+    every one of those dates.
+
+    FIX Bug B: Prior version used glob("part_*"), which does not match
+    master_part_* (used by 2026-07-17). Result: every archive date — both
+    those with a parts/ subdir (Bug A) AND those with top-level master_part_*
+    files (Bug B) — silently skipped the protagonist check.
     """
     import re
-    PART_RE = re.compile(r"^(.+)\.(p(\d{2})of(\d{2})|part_(\d+))$", re.IGNORECASE)
 
-    # bare part_NN files (masters/ format)
-    bare_parts = sorted(directory.glob("part_*"))
+    # ── Strategy 1: bare integer-indexed chunks at the top level ──────────
+    # Match both part_* (e.g. part_0) and master_part_* (e.g. master_part_0).
+    # FIX Bug B: original glob("part_*") missed master_part_* entirely.
+    bare_parts = sorted(
+        list(directory.glob("part_*")) + list(directory.glob("master_part_*"))
+    )
     if bare_parts:
-        # FIX #2: single-part video — cannot compare opening vs closing
         if len(bare_parts) == 1:
-            print(f"  ⚠️  Only one part found in {directory.name} — cannot test protagonist drift. Skipping check.")
+            print(
+                f"  ⚠️  Only one part found in {directory.name} "
+                "— cannot test protagonist drift. Skipping check."
+            )
             return [], []
-        return [bare_parts[0]], [bare_parts[-1]]
+        # Return the full list for both opening and closing so the caller
+        # can reassemble and sample at any timestamp.
+        return bare_parts, bare_parts
 
-    # .pNNofNN files (date-level format)
-    groups = {}
-    for f in directory.iterdir():
-        m = re.match(r"^(.+)\.p(\d{2})of(\d{2})$", f.name)
-        if m:
-            key = m.group(1)
-            num = int(m.group(2))
-            groups.setdefault(key, []).append((num, f))
+    # ── Strategy 2: .pNNofNN files (top-level AND parts/ subdirectory) ────
+    # FIX Bug A: also search the parts/ subdirectory so dates that store
+    # their chunks there (2026-07-09 → 2026-07-16) are discovered.
+    groups: Dict[str, List[Tuple[int, Path]]] = {}
+    search_roots = [directory]
+    parts_subdir = directory / "parts"
+    if parts_subdir.is_dir():
+        search_roots.append(parts_subdir)
+
+    for search_dir in search_roots:
+        for f in search_dir.iterdir():
+            if not f.is_file():
+                continue
+            m = re.match(r"^(.+)\.p(\d{2})of(\d{2})$", f.name)
+            if m:
+                key = m.group(1)
+                num = int(m.group(2))
+                groups.setdefault(key, []).append((num, f))
 
     if not groups:
         return [], []
 
-    # Pick the largest group (main video, not audio)
+    # Pick the group with the most parts (main video, not thumbnail/poster)
     best_key = max(groups, key=lambda k: len(groups[k]))
-    parts = sorted(groups[best_key], key=lambda x: x[0])
-    all_parts = [p for _, p in parts]
+    all_parts = [p for _, p in sorted(groups[best_key], key=lambda x: x[0])]
 
-    # FIX #2: single-part video — cannot compare opening vs closing
     if len(all_parts) == 1:
-        print(f"  ⚠️  Only one part found in {directory.name} — cannot test protagonist drift. Skipping check.")
+        print(
+            f"  ⚠️  Only one part found in {directory.name} "
+            "— cannot test protagonist drift. Skipping check."
+        )
         return [], []
 
-    # Opening = first part, closing = last part
-    return [all_parts[0]], [all_parts[-1]]
+    return all_parts, all_parts
 
 
 # ---------------------------------------------------------------------------------
@@ -209,7 +222,7 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
     Requires PIL.
     """
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
 
         images = []
         for label, data in frames:
@@ -249,33 +262,71 @@ def verify_protagonist(
     """
     Verify protagonist face consistency between opening and closing of reel.
     Returns True if check passes (or was skipped), False if identity drift detected.
+
+    FIX Bug C: Previous version called extract_frame_bytes() on individual
+    binary split chunks (.pNNofNN). Only the first chunk potentially contains
+    the moov atom and is parseable by ffmpeg. The last chunk (used for the
+    closing frame) is raw video data with no container header — ffmpeg always
+    returns None for it — causing verify_protagonist to print "treating as
+    PASS" and return True for every reel, regardless of protagonist drift.
+
+    Fix: reassemble ALL parts into a single temporary MP4 file first (once),
+    then call extract_frame_bytes on the fully assembled file for both the
+    opening frame (t=00:00:01) and the closing frame (t=00:00:30).
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
-    opening_parts, closing_parts = find_parts_in_dir(directory)
+    all_parts, _ = find_parts_in_dir(directory)
 
-    if not opening_parts:
+    if not all_parts:
         print("  ⚠️   No video parts found in directory. Skipping check.")
         return True
 
-    print(f"  📂 Opening part: {opening_parts[0].name}")
-    print(f"  📂 Closing part: {closing_parts[0].name}")
+    print(
+        f"  📂 Found {len(all_parts)} parts: "
+        f"{all_parts[0].name} … {all_parts[-1].name}"
+    )
 
-    # Extract frames
-    # Opening: sample from t=00:00:01 (beginning of opening segment)
-    print("  🎞️   Extracting opening frame (t=00:00:01)...")
-    opening_frame = extract_frame_bytes(opening_parts[0], "00:00:01")
+    # FIX Bug C: Reassemble ALL parts into a single temp MP4 file, then
+    # extract both frames from the assembled file.  Individual .pNNofNN
+    # chunks are raw byte splits of the MP4 container — they are NOT
+    # independently decodable video files.  Only the assembled file can be
+    # reliably decoded by ffmpeg at an arbitrary timestamp.
+    assembled_path: Optional[Path] = None
+    opening_frame: Optional[bytes] = None
+    closing_frame: Optional[bytes] = None
 
-    # FIX #3: Closing part should be sampled near the END of the segment,
-    # not at t=00:00:01 (same as opening). Late-segment drift is undetectable
-    # when both frames come from second 1. Use t=00:00:30 as a heuristic
-    # (most reels are longer than 30 seconds; ffmpeg clamps to the last
-    # available frame if the file is shorter).
-    print("  🎞️   Extracting closing frame (t=00:00:30, near end of closing segment)...")
-    closing_frame = extract_frame_bytes(closing_parts[0], "00:00:30")
+    try:
+        total_bytes = sum(p.stat().st_size for p in all_parts)
+        print(
+            f"  🔗 Reassembling {len(all_parts)} parts "
+            f"({total_bytes / 1_048_576:.1f} MB)…"
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            assembled_path = Path(tmp.name)
+            for part in all_parts:
+                tmp.write(part.read_bytes())
+
+        print("  🎞️   Extracting opening frame (t=00:00:01)…")
+        opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
+
+        # Sample closing frame near end of video.  t=00:00:30 is used as a
+        # heuristic — ffmpeg clamps to the last available frame when the
+        # timestamp exceeds the file duration, so this works for short reels too.
+        print("  🎞️   Extracting closing frame (t=00:00:30)…")
+        closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
+
+    finally:
+        # Always clean up the reassembled temp file (potentially large).
+        if assembled_path is not None:
+            try:
+                assembled_path.unlink()
+            except OSError:
+                pass
 
     if opening_frame is None or closing_frame is None:
-        print("  ⚠️   Could not extract frames (ffmpeg not available or parts too short)")
+        print("  ⚠️   Could not extract frames (ffmpeg not available or file corrupt)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
         print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
         return True
@@ -292,8 +343,8 @@ def verify_protagonist(
         sheet_path = qa_dir / "diag_faces.jpg"
         make_contact_sheet(
             [
-                (f"OPENING\n{opening_parts[0].name}", opening_frame),
-                (f"CLOSING\n{closing_parts[0].name}", closing_frame),
+                (f"OPENING t=00:00:01\n{all_parts[0].name}", opening_frame),
+                (f"CLOSING t=00:00:30\n{all_parts[-1].name}", closing_frame),
             ],
             sheet_path,
         )
@@ -301,8 +352,9 @@ def verify_protagonist(
     # Write JSON report
     report = {
         "directory": str(directory),
-        "opening_part": opening_parts[0].name,
-        "closing_part": closing_parts[0].name,
+        "parts": len(all_parts),
+        "opening_part": all_parts[0].name,
+        "closing_part": all_parts[-1].name,
         "opening_timestamp": "00:00:01",
         "closing_timestamp": "00:00:30",
         "similarity": round(similarity, 4),
@@ -327,7 +379,7 @@ def verify_protagonist(
         return True
     else:
         print(f"  ❌ FAIL: Protagonist identity drift detected! (similarity={similarity:.3f} < {threshold})")
-        print(f"       This means opening and closing shots show different faces.")
+        print(f"       Opening and closing shots show different faces.")
         print(f"       Likely cause: Veo A and Veo B generated with different character seeds.")
         print(f"       Action: Re-render reel with locked protagonist seed across all clips.")
         return False
