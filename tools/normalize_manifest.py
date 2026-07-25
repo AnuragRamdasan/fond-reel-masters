@@ -6,13 +6,20 @@ Fixes (historical):
   Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
                  Python's all() returning True over an empty iterable (vacuous truth).
 
-Fixes (2026-07-26):
+Fixes (2026-07-26 session 1):
   Bug D (HIGH): scan_all() iterated over p.iterdir() for ads-bridge/ and masters/
                 without filtering to directories only. Loose files (README.md,
                 .gitignore, etc.) were appended to dirs and passed to
                 process_directory(), which called directory.rglob("*") on a file
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
+
+Fixes (2026-07-26 session 2):
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_* to populate
+                parts_detail. Directories that use the bare part_* naming convention
+                (e.g. early 2026-07-09 dates) produce an empty parts list, causing
+                the emitted manifest to report parts=0 even when video files exist.
+                Fix: glob both master_part_* and part_*, then deduplicate by name.
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -76,8 +83,19 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
 # ---------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
-    """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    """Schema 1a → Schema 2.
+
+    FIX Bug H: Previously only globbed master_part_* files. Directories that use
+    bare part_* naming (common in earlier 2026-07-09 dates) produced an empty
+    parts_detail list and a manifest stub with parts=0 despite video files existing.
+    Fix: glob both master_part_* and part_*, deduplicate by filename, sort.
+    """
+    # FIX Bug H: collect both naming conventions and deduplicate by name.
+    seen_names: Dict[str, Path] = {}
+    for pf in list(directory.glob("master_part_*")) + list(directory.glob("part_*")):
+        seen_names[pf.name] = pf
+    part_files = sorted(seen_names.values(), key=lambda p: p.name)
+
     parts_info = []
     for pf in part_files:
         parts_info.append({

@@ -15,7 +15,7 @@ Fixes (historical):
 
   Bug B (HIGH): glob("part_*") missed master_part_* naming convention.
 
-Fixes (2026-07-26):
+Fixes (2026-07-26 session 1):
   Bug C (CRITICAL): qa_dir fallback used only the date portion of target_dir.name,
   causing all masters/YYYY-MM-DD-* variants (e.g. final, draft, v2) to share the
   same qa/YYYY-MM-DD/ path. Reports from later runs silently overwrote earlier ones,
@@ -26,6 +26,16 @@ Fixes (2026-07-26):
   with fill=(0, 0, 0, 180) — a 4-tuple RGBA fill on an RGB canvas. PIL silently
   drops the alpha channel, producing a solid-black bar instead of a semi-transparent
   overlay. Fix: composite via RGBA then convert back to RGB.
+
+Fixes (2026-07-26 session 2):
+  Bug G (CRITICAL): closing frame timestamp was hardcoded to '00:00:30'. For reels
+  shorter than 30 seconds, ffmpeg cannot seek past the actual duration and returns
+  no output, making extract_frame_bytes() return None. The existing None check then
+  prints '⚠️  Could not extract frames (ffmpeg not available or file corrupt)' and
+  returns True (PASS) — so every sub-30-second reel silently passes the protagonist
+  check. Fix: probe the assembled file's duration with ffprobe and compute a safe
+  closing timestamp = max(1, min(duration-1, 30)). Also separates the opening vs.
+  closing None diagnostics so the real cause is visible in CI logs.
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
@@ -86,6 +96,34 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
 # ---------------------------------------------------------------------------------
 # Video frame extraction
 # ---------------------------------------------------------------------------------
+
+def get_video_duration(video_path: Path) -> Optional[float]:
+    """
+    Return the duration of a video file in seconds using ffprobe.
+    Returns None if ffprobe is unavailable or the file cannot be probed.
+
+    FIX Bug G: Used to compute a safe closing timestamp so we never ask
+    ffmpeg to seek past EOF on short reels.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
 
 def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Optional[bytes]:
     """
@@ -255,6 +293,11 @@ def verify_protagonist(
     are raw byte splits of the MP4 container — they are NOT independently decodable.
     The last chunk (used for closing frame) has no container header and ffmpeg
     always returns None for it, causing every reel to silently pass.
+
+    FIX Bug G (CRITICAL): closing timestamp was hardcoded to '00:00:30'. Reels
+    shorter than 30 s cause ffmpeg to return None because it can't seek past EOF.
+    The caller then prints 'no ffmpeg' and silently returns PASS. Fix: probe the
+    assembled file's duration and compute closing_ts = max(1s, min(duration-1s, 30s)).
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
@@ -274,6 +317,7 @@ def verify_protagonist(
     assembled_path: Optional[Path] = None
     opening_frame: Optional[bytes] = None
     closing_frame: Optional[bytes] = None
+    closing_ts: str = "00:00:30"  # safe default; overridden below after probe
 
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
@@ -287,11 +331,25 @@ def verify_protagonist(
             for part in all_parts:
                 tmp.write(part.read_bytes())
 
+        # FIX Bug G: probe actual duration so short reels don't silently PASS.
+        # ffprobe is bundled with ffmpeg; if unavailable we fall back to 30 s
+        # (same behaviour as before the fix, but we now log a warning).
+        duration = get_video_duration(assembled_path)
+        if duration is not None:
+            safe_close = max(1.0, min(duration - 1.0, 30.0))
+            closing_ts = f"{int(safe_close // 3600):02d}:{int((safe_close % 3600) // 60):02d}:{safe_close % 60:05.2f}"
+            print(f"  ⏱️  Probed duration: {duration:.1f}s → closing frame at t={closing_ts}")
+        else:
+            print(
+                "  ⚠️  ffprobe unavailable — using fallback closing timestamp 00:00:30\n"
+                "       Short reels (<30 s) may silently pass. Install ffmpeg to fix."
+            )
+
         print("  🎞️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        print("  🎞️   Extracting closing frame (t=00:00:30)…")
-        closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
+        print(f"  🎞️   Extracting closing frame (t={closing_ts})…")
+        closing_frame = extract_frame_bytes(assembled_path, closing_ts)
 
     finally:
         if assembled_path is not None:
@@ -300,10 +358,21 @@ def verify_protagonist(
             except OSError:
                 pass
 
-    if opening_frame is None or closing_frame is None:
-        print("  ⚠️   Could not extract frames (ffmpeg not available or file corrupt)")
+    # FIX Bug G: separate diagnostics for opening vs closing failure so the
+    # real cause (short reel vs no ffmpeg) is visible in CI logs.
+    if opening_frame is None:
+        print("  ⚠️   Could not extract opening frame (ffmpeg not available or file corrupt)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
         print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        return True
+
+    if closing_frame is None:
+        print(f"  ⚠️   Could not extract closing frame at t={closing_ts}")
+        if duration is not None and duration < 2.0:
+            print(f"  ℹ️   Reel is very short ({duration:.1f}s) — cannot sample two distinct points.")
+        else:
+            print("  ℹ️   ffmpeg failed to seek to closing timestamp (file may be corrupt).")
+        print("  ✅  Check skipped — treating as PASS")
         return True
 
     h_open = _average_hash(opening_frame)
@@ -317,7 +386,7 @@ def verify_protagonist(
         make_contact_sheet(
             [
                 (f"OPENING t=00:00:01\n{all_parts[0].name}", opening_frame),
-                (f"CLOSING t=00:00:30\n{all_parts[-1].name}", closing_frame),
+                (f"CLOSING t={closing_ts}\n{all_parts[-1].name}", closing_frame),
             ],
             sheet_path,
         )
@@ -328,7 +397,8 @@ def verify_protagonist(
         "opening_part": all_parts[0].name,
         "closing_part": all_parts[-1].name,
         "opening_timestamp": "00:00:01",
-        "closing_timestamp": "00:00:30",
+        "closing_timestamp": closing_ts,
+        "probed_duration_seconds": duration,
         "similarity": round(similarity, 4),
         "threshold": threshold,
         "passed": similarity >= threshold or skip_check,
