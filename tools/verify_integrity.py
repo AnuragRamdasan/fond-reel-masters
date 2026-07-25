@@ -278,9 +278,21 @@ def main():
         print(f"📁 Checking: {d}")
         report = verify_directory(d, dry_run=args.dry_run)
         if not args.dry_run:
-            qa_dir = root / "qa" / d.name
+            # FIX: Use relative path to avoid collision between same-named dirs
+            # under different parents (e.g. ads-bridge/2026-07-11 vs
+            # masters/2026-07-11). d.name would produce "2026-07-11" for both,
+            # causing one report to silently overwrite the other.
+            qa_dir = root / "qa" / str(d.relative_to(root)).replace("/", "-")
             write_report(report, qa_dir)
-        n_fail = len(report["sha256_mismatch"]) + len(report["missing_parts"])
+        # FIX: Count all four failure categories, not just sha256_mismatch and
+        # missing_parts. Previously size_mismatch and orphaned_manifest_entries
+        # were ignored, causing exit 0 even when corruption was detected.
+        n_fail = (
+            len(report["sha256_mismatch"])
+            + len(report["missing_parts"])
+            + len(report["size_mismatch"])
+            + len(report["orphaned_manifest_entries"])
+        )
         sys.exit(1 if n_fail else 0)
     elif args.all:
         failures = scan_repo(root, dry_run=args.dry_run)
