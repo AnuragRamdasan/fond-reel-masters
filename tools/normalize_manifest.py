@@ -2,14 +2,9 @@
 """
 normalize_manifest.py – Manifest schema normalizer for fond-reel-masters.
 
-Fixes Bug #2: Inconsistent manifest schema across archive dates.
-
-The archive has at least 3 manifest schema variants:
-  Schema 0: No manifest at all
-  Schema 1a: JSON reel manifest  { date, arm, parts, sha256, size, permalink, uguu_video }
-  Schema 1b: JSON ads-bridge     { "asset_name": { sha256, bytes, parts }, ... }
-  Schema 1c: sha256 text file    "HASH  filename" (two-column, like sha256sum output)
-  Schema 2:  Normalised (this script's output)
+Fixes:
+  Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
+                 Python's all() returning True over an empty iterable (vacuous truth).
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -74,7 +69,6 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
-    # Collect parts info
     part_files = sorted(directory.glob("master_part_*"))
     parts_info = []
     for pf in part_files:
@@ -137,18 +131,13 @@ def normalise_sha256_txt(raw: Dict, directory: Path) -> Dict:
 
 def create_empty_manifest(directory: Path) -> Dict:
     """Schema 0 (missing) → Schema 2 stub."""
-    # Infer date from directory name
     date = ""
     m = DATE_RE.match(directory.name)
     if m:
         date = m.group(0)
 
-    # Collect any parts files we can find.
-    # FIX Bug #6: The original code used `not p.suffix in (...)` which, due to
-    # Python operator precedence, parses as `(not p.suffix) in (...)` rather
-    # than the intended `p.suffix not in (...)`. This inverted the filter
-    # entirely: files WITH extensions were excluded and bare files WITHOUT
-    # extensions were included. The correct form is `p.suffix not in (...)`.
+    # FIX Bug #6: `not p.suffix in (...)` parses as `(not p.suffix) in (...)`
+    # due to operator precedence, inverting the filter. Use `p.suffix not in (...)`.
     parts_detail = []
     for p in sorted(directory.rglob("*")):
         if p.is_file() and p.suffix not in (".jpg", ".png", ".json", ".txt", ".md"):
@@ -203,10 +192,9 @@ def process_directory(directory: Path, write: bool = False) -> bool:
         return False
 
     out_path = directory / "manifest.json"
-    print(f"  {'📝' if write else '👁'} {directory.name}: {action}")
+    print(f"  {'\U0001f4dd' if write else '\U0001f441'} {directory.name}: {action}")
 
     if write:
-        # Back up old manifest if it exists
         if out_path.exists():
             backup = directory / "manifest.json.bak"
             out_path.rename(backup)
@@ -215,7 +203,6 @@ def process_directory(directory: Path, write: bool = False) -> bool:
             json.dump(normalised, f, indent=2)
         print(f"     Written: {out_path}")
     else:
-        # Dry run: just show what would be written
         print(f"     Would write to: {out_path}")
         preview = json.dumps(normalised, indent=2)[:400]
         print(f"     Preview:\n{preview}\n     ...")
@@ -228,12 +215,10 @@ def scan_all(root: Path, write: bool = False) -> int:
     count = 0
     dirs = []
 
-    # Date-named top-level dirs
     for item in root.iterdir():
         if item.is_dir() and DATE_RE.match(item.name):
             dirs.append(item)
 
-    # Subdirs of ads-bridge and masters
     for parent in ["ads-bridge", "masters"]:
         p = root / parent
         if p.exists():
@@ -242,7 +227,7 @@ def scan_all(root: Path, write: bool = False) -> int:
                     dirs.append(sub)
 
     for d in sorted(dirs):
-        print(f"\n📁 {d.relative_to(root)}")
+        print(f"\n\U0001f4c1 {d.relative_to(root)}")
         changed = process_directory(d, write=write)
         if changed:
             count += 1
@@ -261,7 +246,7 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("👁 DRY RUN – pass --write to apply changes\n")
+        print("\U0001f441 DRY RUN – pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
@@ -270,7 +255,6 @@ def main():
         n = scan_all(root, write=args.write)
         print(f"\n{'✅' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
     else:
-        # Default: scan all
         n = scan_all(root, write=args.write)
         print(f"\n{'✅' if n else '–'} {n} director{'ies' if n != 1 else 'y'} {'updated' if args.write else 'would be updated'}.")
 

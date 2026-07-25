@@ -3,10 +3,9 @@
 verify_integrity.py – Unified archive integrity verifier for fond-reel-masters.
 
 Fixes:
-  Bug #2: Inconsistent manifest schema / missing manifests
+  Bug #1 (CRITICAL): manifest_missing not counted in exit code → silent CI pass
+  Bug #2 (HIGH): QA report collision when same-named dirs exist under different parents
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
-  Bug #1 (this patch): manifest_missing not counted in exit code → silent pass
-  Bug #4 (this patch): sha256_of_file() dead code removed
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
@@ -48,7 +47,7 @@ def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
 def collect_parts(directory: Path) -> Dict[str, List[Path]]:
     """
     Walk a directory and group .pNNofNN files by logical filename.
-    Single-chunk files (p01of01) are included – this is Bug #4's fix.
+    Single-chunk files (p01of01) are included.
     Returns dict: logical_name -> sorted list of part paths.
     """
     groups: Dict[str, List[Tuple[int, int, Path]]] = defaultdict(list)
@@ -66,7 +65,6 @@ def collect_parts(directory: Path) -> Dict[str, List[Path]]:
     for logical_name, entries in groups.items():
         entries.sort(key=lambda x: x[0])
         expected_total = entries[0][1]
-        # Validate all parts agree on total count
         if any(e[1] != expected_total for e in entries):
             print(f"  ⚠️   WARN: inconsistent total-part count in {logical_name}")
         if len(entries) != expected_total:
@@ -92,7 +90,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
     report = {
         "directory": str(directory),
         "ok": [],
-        "unverified": [],          # FIX #5: new list for entries with no SHA/size in manifest
+        "unverified": [],
         "missing_parts": [],
         "sha256_mismatch": [],
         "size_mismatch": [],
@@ -107,7 +105,6 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
     if manifest is None:
         report["manifest_missing"] = True
         print(f"  ⚠️   No manifest.json in {directory}")
-        # Still check parts exist and compute their hashes
         for logical_name, part_files in parts_map.items():
             digest, total_bytes = sha256_of_parts(part_files)
             report["untracked_files"].append({
@@ -118,14 +115,11 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             })
         return report
 
-    # Schema detection: Bug #2 fix – handle multiple manifest shapes
     schema = manifest.get("schema", 1)
 
     if schema >= 2:
-        # Normalised schema
         assets = manifest.get("assets", {})
     elif "sha256" in manifest and "parts" in manifest:
-        # Reel manifest (date-level, single asset)
         assets = {
             manifest.get("date", "reel"): {
                 "sha256": manifest["sha256"],
@@ -134,18 +128,15 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             }
         }
     else:
-        # ads-bridge manifest: keys are asset filenames
         assets = {k: v for k, v in manifest.items() if isinstance(v, dict) and "sha256" in v}
 
     manifest_keys = set(assets.keys())
     parts_keys = set(parts_map.keys())
 
-    # Orphaned manifest entries (in manifest, no files on disk)
     for key in manifest_keys - parts_keys:
         report["orphaned_manifest_entries"].append(key)
         print(f"  ❌ ORPHANED: {key} is in manifest but has no files on disk")
 
-    # Untracked files (files on disk, not in manifest)
     for key in parts_keys - manifest_keys:
         digest, total_bytes = sha256_of_parts(parts_map[key])
         report["untracked_files"].append({
@@ -156,13 +147,11 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
         })
         print(f"  ⚠️   UNTRACKED: {key} has no manifest entry")
 
-    # Verify files that appear in both
     for key in manifest_keys & parts_keys:
         expected = assets[key]
         part_files = parts_map[key]
         expected_parts = expected.get("parts", len(part_files))
 
-        # Part count check
         if len(part_files) != expected_parts:
             report["missing_parts"].append({
                 "asset": key,
@@ -172,7 +161,6 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             print(f"  ❌ MISSING PARTS: {key}: expected {expected_parts}, found {len(part_files)}")
             continue
 
-        # SHA256 + byte check
         digest, total_bytes = sha256_of_parts(part_files)
         expected_sha = expected.get("sha256", "")
         expected_bytes = expected.get("bytes", 0)
@@ -195,10 +183,6 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             })
             print(f"  ❌ SIZE MISMATCH: {key} expected {expected_bytes}B got {total_bytes}B")
         else:
-            # FIX #5: only mark OK if something was actually verified against
-            # manifest data. If both expected_sha and expected_bytes are absent
-            # (empty string / 0), the file has not been verified against anything
-            # and should be flagged as unverified rather than silently OK'd.
             actually_verified = bool(expected_sha) or bool(expected_bytes)
             if actually_verified:
                 report["ok"].append(key)
@@ -215,7 +199,7 @@ def write_report(report: Dict, qa_dir: Path):
     report_path = qa_dir / "integrity_report.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"  📄 Report written to {report_path}")
+    print(f"  \U0001f4c4 Report written to {report_path}")
 
 
 def scan_repo(root: Path, dry_run: bool = False) -> int:
@@ -233,25 +217,23 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
                     dirs_to_check.append(sub)
 
     for d in sorted(dirs_to_check):
-        print(f"\n📁 Checking: {d}")
+        print(f"\n\U0001f4c1 Checking: {d}")
         report = verify_directory(d, dry_run=dry_run)
 
+        # FIX Bug #1: include manifest_missing in failure count
         n_fail = (
             len(report["missing_parts"])
             + len(report["sha256_mismatch"])
             + len(report["size_mismatch"])
             + len(report["orphaned_manifest_entries"])
-            + (1 if report.get("manifest_missing") else 0)  # FIX Bug #1
+            + (1 if report.get("manifest_missing") else 0)
         )
         failures += n_fail
 
         if not dry_run:
-            # FIX #4: d.name only gives the final path component (no slashes),
-            # so .replace('/', '-') was a no-op. Two subdirs under different
-            # parents (e.g. ads-bridge/2026-07-11 and masters/2026-07-11)
-            # both have d.name == '2026-07-11' and would overwrite each other's
-            # QA report. Use relative_to(root) to get the full relative path
-            # and produce unique names like 'ads-bridge-2026-07-11'.
+            # FIX Bug #2: use full relative path to avoid collision between
+            # same-named dirs under different parents (e.g. ads-bridge/2026-07-11
+            # and masters/2026-07-11 both have d.name == '2026-07-11').
             qa_dir = root / "qa" / str(d.relative_to(root)).replace("/", "-")
             write_report(report, qa_dir)
 
@@ -270,24 +252,19 @@ def main():
 
     if args.dir:
         d = Path(args.dir).resolve()
-        print(f"📁 Checking: {d}")
+        print(f"\U0001f4c1 Checking: {d}")
         report = verify_directory(d, dry_run=args.dry_run)
         if not args.dry_run:
-            # FIX: Use relative path to avoid collision between same-named dirs
-            # under different parents (e.g. ads-bridge/2026-07-11 vs
-            # masters/2026-07-11). d.name would produce "2026-07-11" for both,
-            # causing one report to silently overwrite the other.
+            # FIX Bug #2: unique qa dir per relative path, not just d.name
             qa_dir = root / "qa" / str(d.relative_to(root)).replace("/", "-")
             write_report(report, qa_dir)
-        # FIX Bug #1: Count all four failure categories + manifest_missing.
-        # Previously size_mismatch and orphaned_manifest_entries
-        # were ignored, causing exit 0 even when corruption was detected.
+        # FIX Bug #1: count ALL failure categories including manifest_missing
         n_fail = (
             len(report["sha256_mismatch"])
             + len(report["missing_parts"])
             + len(report["size_mismatch"])
             + len(report["orphaned_manifest_entries"])
-            + (1 if report.get("manifest_missing") else 0)  # FIX Bug #1
+            + (1 if report.get("manifest_missing") else 0)
         )
         sys.exit(1 if n_fail else 0)
     elif args.all:
