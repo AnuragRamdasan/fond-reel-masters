@@ -13,7 +13,7 @@ The archive has at least 3 manifest schema variants:
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
-    python tools/normalize_manifest.py --write      # actually write manifests
+    python tools/normalize_manifest.py --write     # actually write manifests
     python tools/normalize_manifest.py --dir 2026-07-12
     python tools/normalize_manifest.py --all --write
 """
@@ -31,9 +31,9 @@ SCHEMA_VERSION = 2
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Schema detection
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     """
@@ -66,9 +66,9 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     return 0, None  # missing
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Normalisation functions
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
@@ -113,7 +113,6 @@ def normalise_ads_bridge_manifest(raw: Dict, directory: Path) -> Dict:
         "_migrated_from": "schema_1b",
     }
 
-
 def normalise_sha256_txt(raw: Dict, directory: Path) -> Dict:
     """Schema 1c (sha256sum text) → Schema 2."""
     lines = raw.get("lines", [])
@@ -143,9 +142,14 @@ def create_empty_manifest(directory: Path) -> Dict:
         date = m.group(0)
 
     # Collect any parts files we can find
+    # FIX #6: The original code used `not p.suffix in (...)` which, due to Python
+    # operator precedence, parses as `(not p.suffix) in (...)` rather than the
+    # intended `p.suffix not in (...)`. This inverted the filter entirely:
+    # files WITH extensions were excluded and bare files WITHOUT extensions were
+    # included. The correct form is `p.suffix not in (...)`.
     parts_detail = []
     for p in sorted(directory.rglob("*")):
-        if p.is_file() and not p.suffix in (".jpg", ".png", ".json", ".txt", ".md"):
+        if p.is_file() and p.suffix not in (".jpg", ".png", ".json", ".txt", ".md"):
             parts_detail.append({
                 "file": str(p.relative_to(directory)),
                 "bytes": p.stat().st_size,
@@ -165,9 +169,9 @@ def create_empty_manifest(directory: Path) -> Dict:
     }
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 # Main scan
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
 
 def process_directory(directory: Path, write: bool = False) -> bool:
     """
@@ -193,7 +197,7 @@ def process_directory(directory: Path, write: bool = False) -> bool:
         normalised = normalise_sha256_txt(raw, directory)
         action = "MIGRATE (schema 1c → 2)"
     else:
-        print(f"  ⚠️  {directory.name}: unknown schema {schema}, skipping")
+        print(f"  ⚠️   {directory.name}: unknown schema {schema}, skipping")
         return False
 
     out_path = directory / "manifest.json"
