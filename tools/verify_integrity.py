@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-verify_integrity.py — Unified archive integrity verifier for fond-reel-masters.
+verify_integrity.py – Unified archive integrity verifier for fond-reel-masters.
 
 Fixes:
   Bug #2: Inconsistent manifest schema / missing manifests
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
+  Bug #1 (this patch): manifest_missing not counted in exit code → silent pass
+  Bug #4 (this patch): sha256_of_file() dead code removed
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
     python tools/verify_integrity.py --all           # scan entire repo
-    python tools/verify_integrity.py --dry-run      # report only, no writes
+    python tools/verify_integrity.py --dry-run       # report only, no writes
 """
 
 import argparse
@@ -31,14 +33,6 @@ def sha256_of_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_of_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while chunk := f.read(CHUNK_SIZE):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
     """Compute SHA256 and total byte count across ordered part files."""
     h = hashlib.sha256()
@@ -54,7 +48,7 @@ def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
 def collect_parts(directory: Path) -> Dict[str, List[Path]]:
     """
     Walk a directory and group .pNNofNN files by logical filename.
-    Single-chunk files (p01of01) are included — this is Bug #4's fix.
+    Single-chunk files (p01of01) are included – this is Bug #4's fix.
     Returns dict: logical_name -> sorted list of part paths.
     """
     groups: Dict[str, List[Tuple[int, int, Path]]] = defaultdict(list)
@@ -124,7 +118,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
             })
         return report
 
-    # Schema detection: Bug #2 fix — handle multiple manifest shapes
+    # Schema detection: Bug #2 fix – handle multiple manifest shapes
     schema = manifest.get("schema", 1)
 
     if schema >= 2:
@@ -211,7 +205,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
                 print(f"  ✅ OK: {key} ({total_bytes:,} bytes, SHA256 verified)")
             else:
                 report["unverified"].append(key)
-                print(f"  ⚠️  UNVERIFIED: {key} — no SHA256 or size in manifest")
+                print(f"  ⚠️  UNVERIFIED: {key} – no SHA256 or size in manifest")
 
     return report
 
@@ -247,6 +241,7 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
             + len(report["sha256_mismatch"])
             + len(report["size_mismatch"])
             + len(report["orphaned_manifest_entries"])
+            + (1 if report.get("manifest_missing") else 0)  # FIX Bug #1
         )
         failures += n_fail
 
@@ -284,14 +279,15 @@ def main():
             # causing one report to silently overwrite the other.
             qa_dir = root / "qa" / str(d.relative_to(root)).replace("/", "-")
             write_report(report, qa_dir)
-        # FIX: Count all four failure categories, not just sha256_mismatch and
-        # missing_parts. Previously size_mismatch and orphaned_manifest_entries
+        # FIX Bug #1: Count all four failure categories + manifest_missing.
+        # Previously size_mismatch and orphaned_manifest_entries
         # were ignored, causing exit 0 even when corruption was detected.
         n_fail = (
             len(report["sha256_mismatch"])
             + len(report["missing_parts"])
             + len(report["size_mismatch"])
             + len(report["orphaned_manifest_entries"])
+            + (1 if report.get("manifest_missing") else 0)  # FIX Bug #1
         )
         sys.exit(1 if n_fail else 0)
     elif args.all:
