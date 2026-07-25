@@ -141,12 +141,12 @@ def create_empty_manifest(directory: Path) -> Dict:
     if m:
         date = m.group(0)
 
-    # Collect any parts files we can find
-    # FIX #6: The original code used `not p.suffix in (...)` which, due to Python
-    # operator precedence, parses as `(not p.suffix) in (...)` rather than the
-    # intended `p.suffix not in (...)`. This inverted the filter entirely:
-    # files WITH extensions were excluded and bare files WITHOUT extensions were
-    # included. The correct form is `p.suffix not in (...)`.
+    # Collect any parts files we can find.
+    # FIX Bug #6: The original code used `not p.suffix in (...)` which, due to
+    # Python operator precedence, parses as `(not p.suffix) in (...)` rather
+    # than the intended `p.suffix not in (...)`. This inverted the filter
+    # entirely: files WITH extensions were excluded and bare files WITHOUT
+    # extensions were included. The correct form is `p.suffix not in (...)`.
     parts_detail = []
     for p in sorted(directory.rglob("*")):
         if p.is_file() and p.suffix not in (".jpg", ".png", ".json", ".txt", ".md"):
