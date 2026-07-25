@@ -2,7 +2,7 @@
 """
 verify_protagonist.py — Protagonist face-identity pre-commit guard for fond-reel-masters.
 
-Fixes:
+Fixes (historical):
   Bug #4 (CRITICAL): extract_frame_bytes() was called on individual raw .pNNofNN
   chunks. Only the first chunk has a container header; the last chunk (closing frame)
   is raw byte data that ffmpeg cannot parse, so it always returned None and was
@@ -14,6 +14,18 @@ Fixes:
   missing parts/ subdirectory (used by 2026-07-09 → 2026-07-16).
 
   Bug B (HIGH): glob("part_*") missed master_part_* naming convention.
+
+Fixes (2026-07-26):
+  Bug C (CRITICAL): qa_dir fallback used only the date portion of target_dir.name,
+  causing all masters/YYYY-MM-DD-* variants (e.g. final, draft, v2) to share the
+  same qa/YYYY-MM-DD/ path. Reports from later runs silently overwrote earlier ones,
+  which could mask a failing reel if it wasn't the last directory checked.
+  Fix: use full path relative to repo root (same pattern as verify_integrity.py Bug #2).
+
+  Bug F (MEDIUM): make_contact_sheet() converted image to RGB then drew a rectangle
+  with fill=(0, 0, 0, 180) — a 4-tuple RGBA fill on an RGB canvas. PIL silently
+  drops the alpha channel, producing a solid-black bar instead of a semi-transparent
+  overlay. Fix: composite via RGBA then convert back to RGB.
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
@@ -183,16 +195,30 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
 # ---------------------------------------------------------------------------------
 
 def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
-    """Create a side-by-side contact sheet from labeled frame bytes. Requires PIL."""
+    """Create a side-by-side contact sheet from labeled frame bytes. Requires PIL.
+
+    FIX Bug F: Previously converted image to RGB then drew with fill=(0,0,0,180)
+    — a 4-tuple RGBA fill on an RGB canvas. PIL silently drops the alpha, producing
+    a solid-black bar. Fix: composite via RGBA then convert back to RGB so the
+    semi-transparent overlay actually renders correctly.
+    """
     try:
         from PIL import Image, ImageDraw
 
         images = []
         for label, data in frames:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
+            # FIX Bug F: open as RGBA so alpha compositing works correctly
+            img = Image.open(io.BytesIO(data)).convert("RGBA")
             img = img.resize((320, 480), Image.LANCZOS)
+
+            # Create a transparent overlay, draw the semi-transparent label bar on it,
+            # then alpha-composite onto the image before converting to RGB for saving.
+            overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            draw_overlay = ImageDraw.Draw(overlay)
+            draw_overlay.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))
+            img = Image.alpha_composite(img, overlay).convert("RGB")
+
             draw = ImageDraw.Draw(img)
-            draw.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))
             draw.text((8, 6), label, fill=(255, 255, 255))
             images.append(img)
 
@@ -202,8 +228,8 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
             sheet.paste(img, (i * 320, 0))
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        sheet.save(str(output_path), "JPEG", quality=85)
-        print(f"  \U0001f4f8 Contact sheet saved: {output_path}")
+        sheet.save(str(output_path), "JPEG", quality=90)
+        print(f"  📸 Contact sheet saved: {output_path}")
 
     except ImportError:
         print("  ⚠️   PIL not available — skipping contact sheet generation")
@@ -230,7 +256,7 @@ def verify_protagonist(
     The last chunk (used for closing frame) has no container header and ffmpeg
     always returns None for it, causing every reel to silently pass.
     """
-    print(f"\U0001f3ac Verifying protagonist consistency in: {directory}")
+    print(f"🎬 Verifying protagonist consistency in: {directory}")
 
     all_parts, _ = find_parts_in_dir(directory)
 
@@ -239,7 +265,7 @@ def verify_protagonist(
         return True
 
     print(
-        f"  \U0001f4c2 Found {len(all_parts)} parts: "
+        f"  📂 Found {len(all_parts)} parts: "
         f"{all_parts[0].name} … {all_parts[-1].name}"
     )
 
@@ -252,7 +278,7 @@ def verify_protagonist(
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
         print(
-            f"  \U0001f517 Reassembling {len(all_parts)} parts "
+            f"  🔗 Reassembling {len(all_parts)} parts "
             f"({total_bytes / 1_048_576:.1f} MB)…"
         )
 
@@ -261,10 +287,10 @@ def verify_protagonist(
             for part in all_parts:
                 tmp.write(part.read_bytes())
 
-        print("  \U0001f39e️   Extracting opening frame (t=00:00:01)…")
+        print("  🎞️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        print("  \U0001f39e️   Extracting closing frame (t=00:00:30)…")
+        print("  🎞️   Extracting closing frame (t=00:00:30)…")
         closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
 
     finally:
@@ -284,7 +310,7 @@ def verify_protagonist(
     h_close = _average_hash(closing_frame)
     similarity = hash_similarity(h_open, h_close)
 
-    print(f"  \U0001f52c Face similarity score: {similarity:.3f} (threshold: {threshold:.2f})")
+    print(f"  🔬 Face similarity score: {similarity:.3f} (threshold: {threshold:.2f})")
 
     if qa_dir:
         sheet_path = qa_dir / "diag_faces.jpg"
@@ -314,7 +340,7 @@ def verify_protagonist(
         qa_dir.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2)
-        print(f"  \U0001f4c4 Report: {report_path}")
+        print(f"  📄 Report: {report_path}")
 
     if skip_check:
         print(f"  ℹ️   Check skipped (--skip-check). Similarity was {similarity:.3f}")
@@ -360,10 +386,15 @@ def main():
     if args.qa_dir:
         qa_dir = Path(args.qa_dir)
     else:
-        import re
-        m = re.search(r"\d{4}-\d{2}-\d{2}", target_dir.name)
-        date = m.group(0) if m else target_dir.name
-        qa_dir = repo_root / "qa" / date
+        # FIX Bug C: use full relative path (not just date prefix) to avoid
+        # qa_dir collision between same-date variants like masters/2026-07-24-final
+        # and masters/2026-07-24-draft both resolving to qa/2026-07-24/.
+        # Mirrors the fix applied to verify_integrity.py (Bug #2, PR #3).
+        try:
+            rel = target_dir.relative_to(repo_root)
+        except ValueError:
+            rel = Path(target_dir.name)
+        qa_dir = repo_root / "qa" / str(rel).replace("/", "-")
 
     passed = verify_protagonist(
         target_dir,
