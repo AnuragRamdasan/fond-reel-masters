@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-verify_integrity.py – Unified archive integrity verifier for fond-reel-masters.
+verify_integrity.py — Unified archive integrity verifier for fond-reel-masters.
 
 Fixes:
   Bug #1 (CRITICAL): manifest_missing not counted in exit code → silent CI pass
   Bug #2 (HIGH): QA report collision when same-named dirs exist under different parents
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
+  Bug I (LOW): Dead sha256_of_bytes() function removed — all hashing uses the
+               streaming sha256_of_parts() to avoid loading multi-GB video into memory.
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
-    python tools/verify_integrity.py --all           # scan entire repo
-    python tools/verify_integrity.py --dry-run       # report only, no writes
+    python tools/verify_integrity.py --all          # scan entire repo
+    python tools/verify_integrity.py --dry-run      # report only, no writes
 """
 
 import argparse
@@ -28,8 +30,9 @@ PART_RE = re.compile(r"^(.+)\.p(\d{2})of(\d{2})$")
 CHUNK_SIZE = 65536  # 64 KB read buffer
 
 
-def sha256_of_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# sha256_of_bytes() removed (Bug I fix).
+# It loaded the entire file into memory (OOM risk on multi-GB video files)
+# and was never called — all hashing goes through sha256_of_parts() below.
 
 
 def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
@@ -189,7 +192,7 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
                 print(f"  ✅ OK: {key} ({total_bytes:,} bytes, SHA256 verified)")
             else:
                 report["unverified"].append(key)
-                print(f"  ⚠️  UNVERIFIED: {key} – no SHA256 or size in manifest")
+                print(f"  ⚠️  UNVERIFIED: {key} — no SHA256 or size in manifest")
 
     return report
 
