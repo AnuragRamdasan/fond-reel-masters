@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-normalize_manifest.py – Manifest schema normalizer for fond-reel-masters.
+normalize_manifest.py — Manifest schema normalizer for fond-reel-masters.
 
 Fixes (historical):
   Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
@@ -13,6 +13,14 @@ Fixes (2026-07-26):
                 process_directory(), which called directory.rglob("*") on a file
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
+
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_*. Directories
+                from the 2026-07-09 era use bare part_0, part_1… naming. The glob
+                returns [], so the emitted manifest has "parts": 0 and
+                "parts_detail": []. Downstream verify_integrity.py then sees
+                MISSING PARTS or UNTRACKED failures — systematic false CI failures.
+                Fix: glob both master_part_* and part_*, deduplicate by filename,
+                sort by name.
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -56,7 +64,7 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
         if "date" in data and "arm" in data and isinstance(data.get("parts"), int):
             return 1, data  # 1a
         # Ads-bridge manifest: values are dicts with sha256/bytes/parts
-        # FIX Bug #3: guard against empty JSON {} – all() over empty iterable
+        # FIX Bug #3: guard against empty JSON {} — all() over empty iterable
         # returns True (vacuous truth), causing {} to be misdetected as schema 1b.
         if data and all(isinstance(v, dict) for v in data.values()):
             return 11, data  # 1b
@@ -77,7 +85,18 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    # FIX Bug H: glob both master_part_* and part_*, deduplicate by filename,
+    # sort by name. Previously only master_part_* was globbed, so directories
+    # using bare part_0, part_1… naming (2026-07-09 era) produced an empty
+    # parts_detail list and a manifest with "parts": 0.
+    part_files_raw = list(directory.glob("master_part_*")) + list(directory.glob("part_*"))
+    seen: set = set()
+    part_files = []
+    for pf in sorted(part_files_raw, key=lambda p: p.name):
+        if pf.name not in seen:
+            seen.add(pf.name)
+            part_files.append(pf)
+
     parts_info = []
     for pf in part_files:
         parts_info.append({
@@ -261,7 +280,7 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("👁 DRY RUN – pass --write to apply changes\n")
+        print("👁 DRY RUN — pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
