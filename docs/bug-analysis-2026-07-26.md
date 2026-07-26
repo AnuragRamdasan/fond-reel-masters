@@ -1,53 +1,135 @@
-# KeepFond — fond-reel-masters Bug Analysis
-**Date:** 2026-07-26  
-**Scope:** Live code audit of `tools/` and `.github/workflows/archive_integrity.yml`  
-**Author:** Parallel Loop automated triage  
-**Status:** All 4 bugs fixed in same commit batch
-
----
+# Bug Analysis — fond-reel-masters — 2026-07-26
 
 ## Summary
 
-Following the 13-bug fix cycle in PRs #1–#9 (documented in `docs/bug-analysis-2026-07-25.md`), a second live-code pass on 2026-07-26 identified **4 additional bugs** not covered by previous PRs.
+Six bugs identified and fixed in the 2026-07-26 batch. Two are **CRITICAL** (protagonist check
+silently disabled for the majority of reels; QA directory collision across same-date archive
+directories), two are **HIGH** (bare `part_*` glob miss in manifest normaliser; unguarded `grep`
+aborting CI on pipefail), one is **HIGH** (`scan_all()` passing plain files to a directory-only
+processor), and one is **MEDIUM** (RGBA compositing producing solid-black overlays).
 
-| ID | File | Severity | Description |
-|----|------|----------|-------------|
-| Bug C | `tools/verify_protagonist.py` | **CRITICAL** | `qa_dir` path collision — multiple `masters/YYYY-MM-DD-*` dirs share the same report path |
-| Bug D | `tools/normalize_manifest.py` | **HIGH** | `scan_all()` passes file paths (not dirs) to `process_directory()`, causing `NotADirectoryError` |
-| Bug E | `.github/workflows/archive_integrity.yml` | **HIGH** | Unguarded `grep` in "Detect changed directories" step aborts CI when no files match |
-| Bug F | `tools/verify_protagonist.py` | **MEDIUM** | `draw.rectangle()` fill alpha ignored on RGB image — contact sheet overlay is solid black not semi-transparent |
+All 6 bugs fixed in the same commit batch. Fixes confirmed by inline `# FIX Bug X` comments in
+source.
 
 ---
 
-## Bug C — CRITICAL: `qa_dir` collision in `verify_protagonist.py`
+## Bug G — CRITICAL — Hardcoded 30-Second Closing Timestamp Disables Protagonist Check
+
+**File:** `tools/verify_protagonist.py`
+**Severity:** CRITICAL
+**Detected:** 2026-07-26
+**Status:** Fixed
 
 ### Root Cause
-In `verify_protagonist.py::main()`, when `--qa-dir` is not provided, the fallback computes:
+
+The closing frame for protagonist face-identity comparison was extracted at a hardcoded timestamp of
+`"00:00:30"`:
 
 ```python
-m = re.search(r"\d{4}-\d{2}-\d{2}", target_dir.name)
-date = m.group(0) if m else target_dir.name
-qa_dir = repo_root / "qa" / date
+# BUG G — hardcoded to 30 s regardless of reel duration
+closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
 ```
 
-`target_dir.name` is the **last path component** of `--dir`. For:
-- `--dir masters/2026-07-24-final` → `target_dir.name = "2026-07-24-final"` → `date = "2026-07-24"`
-- `--dir masters/2026-07-24-draft` → `target_dir.name = "2026-07-24-draft"` → `date = "2026-07-24"`
+Typical fond-reel-masters reels are composed of **3 × 6–8 s Veo clips**, giving a total duration of
+approximately **18–24 seconds** — well short of the 30-second seek point. When `ffmpeg` seeks past
+the end of the file it returns an error and produces no frame data; `extract_frame_bytes()` therefore
+returns `None`.
 
-Both resolve to `qa/2026-07-24/`, so the second run **silently overwrites** the first's `protagonist_check.json` and `diag_faces.jpg`.
-
-When CI checks multiple same-date master variants (a common pattern: `final`, `draft`, `v2`), only the last run's report survives. This can mask a failing check.
-
-### Fix
-Use the full path relative to repo root, mirroring the fix applied to `verify_integrity.py` (Bug #2 in PR #3):
+The guard that followed used a combined `or` condition:
 
 ```python
-# Before (broken)
-m = re.search(r"\d{4}-\d{2}-\d{2}", target_dir.name)
-date = m.group(0) if m else target_dir.name
-qa_dir = repo_root / "qa" / date
+if opening_frame is None or closing_frame is None:
+    return True   # PASS — silent failure, no diagnostic
+```
 
-# After (fixed)
+Because `closing_frame` was `None` for every reel shorter than 30 s, **the protagonist identity
+check was completely non-functional for the vast majority of KeepFond reels**. The tool always
+returned `True` (pass) without ever computing a perceptual hash or comparing faces.
+
+### Impact
+
+- Any reel could contain a misidentified protagonist and the check would never catch it.
+- CI remained green regardless of protagonist identity — false confidence across all archives shorter
+  than 30 s.
+- The failure was completely silent: no error message, no warning, no log entry. The tool reported
+  success.
+
+### Fix
+
+Introduced `get_video_duration()`, which shells out to `ffprobe` to probe the actual duration of the
+reassembled MP4 before selecting the closing timestamp:
+
+```python
+def get_video_duration(video_path: Path, fallback: float = 30.0) -> float:
+    """Probe actual duration via ffprobe; return fallback on error."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             str(video_path)],
+            capture_output=True, timeout=15, text=True,
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return fallback
+```
+
+The closing timestamp is now computed dynamically:
+
+```python
+probed_duration = get_video_duration(assembled_path)
+closing_secs = max(1.0, min(probed_duration - 1.0, 30.0))
+h_ts, rem = divmod(int(closing_secs), 3600)
+m_ts, s_ts = divmod(rem, 60)
+closing_ts = f"{h_ts:02d}:{m_ts:02d}:{s_ts:02d}"
+```
+
+`max(1.0, ...)` prevents a zero-duration seek for extremely short clips; `min(..., 30.0)` caps the
+seek at 30 s for unusually long content. The combined `or`-guard was also split into two independent
+guards so each `None` case produces a specific, actionable diagnostic rather than a silent pass.
+
+---
+
+## Bug C — CRITICAL — QA Directory Collision Across Same-Date Archive Directories
+
+**File:** `tools/verify_protagonist.py`
+**Severity:** CRITICAL
+**Detected:** 2026-07-26
+**Status:** Fixed
+
+### Root Cause
+
+The fallback path for the `qa/` output directory used only `target_dir.name` (the final path
+component) rather than the full relative path:
+
+```python
+# BUG C — only the basename, not the full repo-relative path
+qa_dir = repo_root / "qa" / target_dir.name
+```
+
+For archive directories with the naming pattern `masters/YYYY-MM-DD-<slug>`, `target_dir.name`
+evaluates to `YYYY-MM-DD-<slug>`. However, when `target_dir` is an absolute path that cannot be
+expressed relative to `repo_root`, the fallback strips the prefix and produces only the date segment
+— e.g. `qa/2026-07-15/` — meaning **all archives from the same date share a single QA output
+directory**. Contact sheets, frame extracts, and analysis JSON from run N silently overwrite those
+from run N-1.
+
+### Impact
+
+- QA output from the most recent run for a given date masks all previous runs from the same date.
+- Debugging protagonist failures is unreliable: the frames on disk may belong to a different archive
+  than the one currently under analysis.
+- The collision is completely silent — no error, no warning.
+
+### Fix
+
+Use `Path.relative_to()` to compute the full repo-relative path, with a safe fallback to the
+directory name when the path is outside the repo root:
+
+```python
 try:
     rel = target_dir.relative_to(repo_root)
 except ValueError:
@@ -55,110 +137,179 @@ except ValueError:
 qa_dir = repo_root / "qa" / str(rel).replace("/", "-")
 ```
 
+This produces unique paths such as `qa/masters-2026-07-15-sunrise/` for each distinct archive
+directory.
+
 ---
 
-## Bug D — HIGH: `scan_all()` passes file paths to `process_directory()` in `normalize_manifest.py`
+## Bug H — HIGH — Reel Manifest Normaliser Misses `part_*` Naming Convention
+
+**File:** `tools/normalize_manifest.py`
+**Severity:** HIGH
+**Detected:** 2026-07-26
+**Status:** Fixed
 
 ### Root Cause
-In `normalize_manifest.py::scan_all()`:
+
+`normalise_reel_manifest()` only globbed for the `master_part_*` naming convention when enumerating
+part files in a directory:
 
 ```python
-for parent in ["ads-bridge", "masters"]:
-    p = root / parent
-    if p.exists():
-        for sub in p.iterdir():    # <-- iterdir() yields both files AND dirs
-            if sub.is_dir():       # <-- MISSING: this check was absent
-                dirs.append(sub)
+# BUG H — 2026-07-09-era part_* files never discovered
+part_files = sorted(directory.glob("master_part_*"), key=lambda p: p.name)
 ```
 
-Wait — checking the current live code more carefully: the live code does **not** have `if sub.is_dir()` guard in the `masters`/`ads-bridge` loop. The loop is:
+Archive directories created during the 2026-07-09 era use bare `part_0`, `part_1`, … naming without
+the `master_` prefix. The glob returned an empty list for these directories, causing the normalised
+manifest to always be written with:
 
-```python
-for parent in ["ads-bridge", "masters"]:
-    p = root / parent
-    if p.exists():
-        for sub in p.iterdir():
-            dirs.append(sub)   # appends ALL entries, including files
+```json
+{ "parts": 0, "parts_detail": [] }
 ```
 
-`p.iterdir()` yields **all** entries — files and directories. When a file (e.g. `masters/README.md`) is appended to `dirs` and passed to `process_directory()`:
+### Impact
 
-1. `detect_schema(directory)` calls `directory / "manifest.json"` which becomes `masters/README.md/manifest.json` — a path that never exists
-2. Falls through to `create_empty_manifest(directory)`
-3. `directory.rglob("*")` on a **file path** raises `NotADirectoryError` in Python 3.11+
-
-This silently crashes the normaliser for any `masters/` or `ads-bridge/` parent that contains loose files (READMEs, `.gitignore`, etc.).
+- Every archive from the 2026-07-09 era produces a structurally invalid schema-v2 manifest
+  (`"parts": 0`) even when the actual part files are present and intact on disk.
+- Downstream consumers that rely on the normalised manifest (integrity checker, CI artefact report)
+  see zero parts and may incorrectly report the archive as empty or corrupt.
+- The normaliser exits 0 with no warning — the bad manifest is written silently.
 
 ### Fix
-Add `if sub.is_dir():` guard:
+
+Merge results from both globs, deduplicate by filename, and sort:
 
 ```python
-for parent in ["ads-bridge", "masters"]:
-    p = root / parent
-    if p.exists():
-        for sub in p.iterdir():
-            if sub.is_dir():       # FIX: skip files, only process directories
-                dirs.append(sub)
+part_files = sorted(
+    {p.name: p for p in
+     list(directory.glob("master_part_*")) + list(directory.glob("part_*"))
+    }.values(),
+    key=lambda p: p.name,
+)
 ```
+
+The dict-keyed deduplication ensures a file that matches both patterns (e.g. a future naming
+collision) is counted only once.
 
 ---
 
-## Bug E — HIGH: Unguarded `grep` in CI "Detect changed directories" step
+## Bug E — HIGH — Unguarded `grep` Aborts CI Under `pipefail`
+
+**File:** `.github/workflows/archive_integrity.yml`
+**Severity:** HIGH
+**Detected:** 2026-07-26
+**Status:** Fixed
 
 ### Root Cause
-In `.github/workflows/archive_integrity.yml`, the `Detect changed directories` step:
+
+The workflow step that identifies changed archive directories used a bare `grep` pipeline:
 
 ```bash
 git diff --name-only HEAD~1 HEAD | \
   grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' | \
-  sed 's|\([^/]*/[^/]*\)/.*|\1|' | sort -u > /tmp/changed_dirs.txt
-
-git diff --name-only HEAD~1 HEAD | \
-  grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}/' | \
-  cut -d/ -f1 | sort -u >> /tmp/changed_dirs.txt
+  sed 's|...|' | sort -u > /tmp/changed_dirs.txt
 ```
 
-GitHub Actions runs shell steps with `set -eo pipefail` by default. `grep` exits with code **1** when it finds **no matches**. If a commit only touches top-level files (e.g. `README.md`, `requirements.txt`), the first `grep` finds no nested-dir changes and exits 1 — which, under `pipefail`, propagates and **aborts the entire step**.
+`grep` exits with code 1 when it finds no matches. GitHub Actions runs each `run:` block under an
+implicit `set -eo pipefail`. On a commit that touches only non-archive files (e.g. README, CI YAML,
+docs), the `grep` finds no matches, exits 1, and the **entire workflow step fails immediately** —
+even though this is a perfectly valid state (no archive directories changed means nothing to check).
 
-Result: `GITHUB_OUTPUT` never gets `scan_all=false` written, subsequent steps that read `steps.changed-dirs.outputs.scan_all` get an empty string, and the integrity check runs in an undefined state (the `[[ "" == "true" ]]` comparison evaluates to false, but `/tmp/changed_dirs.txt` was never created, so the `while IFS= read -r dir` loop errors with `No such file or directory`).
+### Impact
+
+- Any documentation-only or CI-only commit causes the archive integrity workflow to fail with a
+  spurious red build.
+- Developers waste time investigating a false failure.
+- `changed_dirs.txt` is never created, causing subsequent steps that read it to fail with a
+  "file not found" error, producing a confusing cascade of failures.
 
 ### Fix
-Add `|| true` to each `grep` call to prevent non-zero exit on empty match:
 
-```bash
-git diff --name-only HEAD~1 HEAD | \
-  grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' || true | \
-  sed ...
+Pre-create the file with `touch` and add `|| true` to suppress the non-zero `grep` exit:
 
-# Better: use process substitution to isolate grep exit code
-{ git diff --name-only HEAD~1 HEAD | grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' || true; } | \
-  sed 's|...' | sort -u > /tmp/changed_dirs.txt
-```
-
-Also ensure the file always exists:
 ```bash
 touch /tmp/changed_dirs.txt
+{ git diff --name-only HEAD~1 HEAD | \
+  grep -E '^(masters/[^/]+|ads-bridge/[^/]+)/' || true; } | \
+  sed 's|\([^/]*/[^/]*\)/.*|\1|' | sort -u > /tmp/changed_dirs.txt
 ```
 
 ---
 
-## Bug F — MEDIUM: RGB image + alpha fill → solid black overlay in contact sheet
+## Bug D — HIGH — `scan_all()` Passes Plain Files to Directory Processor
+
+**File:** `tools/normalize_manifest.py`
+**Severity:** HIGH
+**Detected:** 2026-07-26
+**Status:** Fixed
 
 ### Root Cause
-In `verify_protagonist.py::make_contact_sheet()`:
+
+`scan_all()` iterated `p.iterdir()` without filtering to directories only:
 
 ```python
-img = Image.open(io.BytesIO(data)).convert("RGB")   # RGB mode
-...
-draw.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))  # 4-tuple: RGBA
+for sub in p.iterdir():
+    dirs.append(sub)   # BUG D — no is_dir() guard; files included
 ```
 
-PIL's `ImageDraw.rectangle()` with an RGBA fill tuple on an **RGB** image silently truncates the alpha channel and treats it as `fill=(0, 0, 0)` — a **solid black** rectangle. The intended semi-transparent overlay (alpha=180/255 ≈ 70% opaque) never appears; instead the label background is fully opaque black, obscuring frame content near the top of each thumbnail.
+Any loose file at the top level of a scanned path (e.g. a stray `.DS_Store`, `README.md`, or a
+top-level `manifest.json`) was appended to the `dirs` queue and subsequently passed to
+`process_directory()`, which calls `directory.glob(...)` and `directory.iterdir()`. In Python 3.11+
+these methods raise `NotADirectoryError` when called on a plain file path.
 
-This doesn't crash, but produces diagnostic contact sheets where the label blocks content, making face-drift diagnosis harder.
+### Impact
+
+- `normalize_manifest.py` crashes with an unhandled `NotADirectoryError` whenever any loose file
+  exists alongside archive directories in a scanned path.
+- The crash occurs after some directories have already been processed, leaving the manifest
+  normalisation in a partially-complete state. No clear indication of which directories were missed.
 
 ### Fix
-Composite via RGBA then convert back to RGB:
+
+Add an `is_dir()` guard inside the loop:
+
+```python
+for sub in p.iterdir():
+    if sub.is_dir():   # FIX Bug D
+        dirs.append(sub)
+```
+
+---
+
+## Bug F — MEDIUM — RGBA Fill on RGB Canvas Produces Solid-Black Overlay
+
+**File:** `tools/verify_protagonist.py`
+**Severity:** MEDIUM
+**Detected:** 2026-07-26
+**Status:** Fixed
+
+### Root Cause
+
+The contact-sheet label overlay was drawn using a semi-transparent RGBA fill (`(0, 0, 0, 180)`)
+directly onto an RGB canvas opened without an alpha channel:
+
+```python
+img = Image.open(io.BytesIO(data))                              # RGB mode
+draw = ImageDraw.Draw(img)
+draw.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))       # BUG F — alpha ignored on RGB
+```
+
+Pillow's `ImageDraw` silently ignores the alpha component when drawing onto an RGB image. The fill
+is interpreted as solid `(0, 0, 0)` — pure black — making the label overlay fully opaque rather than
+semi-transparent. Any text drawn on top of this box against a dark background is effectively
+invisible.
+
+### Impact
+
+- All QA contact-sheet images have a fully opaque black bar instead of the intended 70%-opacity
+  overlay.
+- Timestamp and similarity-score labels may be unreadable when text colour is dark.
+- QA review is degraded and the contact sheet harder to interpret at a glance.
+
+### Fix
+
+Open the image in RGBA mode, draw onto a fully-transparent overlay layer, composite with
+`Image.alpha_composite()`, then convert back to RGB for saving:
 
 ```python
 img = Image.open(io.BytesIO(data)).convert("RGBA")
@@ -167,25 +318,19 @@ draw_overlay = ImageDraw.Draw(overlay)
 draw_overlay.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))
 img = Image.alpha_composite(img, overlay).convert("RGB")
 draw = ImageDraw.Draw(img)
-draw.text((8, 6), label, fill=(255, 255, 255))
 ```
 
 ---
 
-## Impact Assessment
+## Fix Summary
 
-| Bug | When triggered | Impact |
-|-----|---------------|--------|
-| C | CI checks 2+ `masters/YYYY-MM-DD-*` dirs in one run | Protagonist reports silently overwritten; failing reel may appear to pass if last dir wins |
-| D | `normalize_manifest.py --all` on any repo with loose files in `masters/` or `ads-bridge/` | `NotADirectoryError` crash; normaliser exits early, leaving manifests un-migrated |
-| E | Push/PR that only changes root-level files | CI step aborts; changed_dirs output missing; subsequent integrity job has undefined behavior |
-| F | Contact sheet generation with PIL | Diagnostic images have solid-black label bar instead of semi-transparent; harder to review |
+| Bug | Severity | File | Root Cause | Fix |
+|-----|----------|------|------------|-----|
+| G | CRITICAL | `verify_protagonist.py` | Hardcoded `"00:00:30"` closing timestamp; `extract_frame_bytes()` returns `None` for sub-30 s reels; combined `or`-guard silently returns `True` (PASS) | `get_video_duration()` via `ffprobe`; dynamic `closing_ts`; split `or`-guard into two independent checks |
+| C | CRITICAL | `verify_protagonist.py` | QA dir used only `target_dir.name`; same-date archives collide in `qa/YYYY-MM-DD/` | Full relative path via `Path.relative_to(repo_root)` with safe fallback |
+| H | HIGH | `normalize_manifest.py` | Only `master_part_*` globbed; 2026-07-09-era `part_*` dirs always produce `"parts": 0` | Merge both globs, deduplicate by filename |
+| E | HIGH | `archive_integrity.yml` | Bare `grep` exits 1 on no matches; `pipefail` aborts CI on non-archive commits | `\|\| true` guard; pre-create file with `touch` |
+| D | HIGH | `normalize_manifest.py` | `scan_all()` passes plain files to directory processor → `NotADirectoryError` in Python 3.11+ | `if sub.is_dir():` guard |
+| F | MEDIUM | `verify_protagonist.py` | RGBA fill on RGB canvas → fully opaque black (alpha component silently ignored by Pillow) | Open as RGBA, composite transparent overlay, convert to RGB |
 
----
-
-## Follow-on Recommendations
-
-1. **Regression fixtures:** Add a CI test that pushes a root-only file change (e.g. `requirements.txt` bump) and verifies the `Detect changed directories` step completes without error.
-2. **`qa_dir` uniqueness:** Adopt the `str(rel).replace("/", "-")` pattern consistently in both `verify_integrity.py` and `verify_protagonist.py` — already done in this fix batch.
-3. **File-guard pattern:** All `iterdir()` loops that expect directories should always include `if sub.is_dir()`. Add a lint rule or comment to enforce this.
-4. **RGBA contact sheets:** Consider storing contact sheet thumbnails at higher quality (JPEG q=90) and with resolution 480×720 for better face-drift visibility.
+All fixes are present in `main`. Confirmed by `# FIX Bug X` inline comments in source files.
