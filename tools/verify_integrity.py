@@ -18,12 +18,18 @@ Fixes:
                branch for single-asset reel manifests.
   Bug L (LOW): Lexicographic sort orders part_10 before part_2 for >=10 parts.
                Fixed with _natural_sort_key() helper using re.split on digit runs.
+  Bug O (HIGH): scan_repo() hard-coded only ("ads-bridge", "masters") as parent
+               directories to descend into. audition/, covers/, drafts/, and
+               screen-inserts/ were silently skipped, leaving their archive content
+               unprotected by integrity checks. Fixed with dynamic parent discovery:
+               any top-level directory that is not date-named AND not in a known-skip
+               set is treated as a parent of archive subdirectories.
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
     python tools/verify_integrity.py --all            # scan entire repo
     python tools/verify_integrity.py --dry-run        # report only, no writes
-!min
+"""
 
 import argparse
 import hashlib
@@ -38,6 +44,12 @@ from typing import Dict, List, Optional, Tuple
 
 PART_RE = re.compile(r"^(.+)\.p(\d{2})of(\d{2})$")
 CHUNK_SIZE = 65536  # 64 KB read buffer
+
+# FIX Bug O: directories that should never be treated as archive parents.
+# These are repo-infrastructure dirs, not content dirs.
+_SCAN_SKIP_DIRS = frozenset({
+    ".github", ".git", "tools", "docs", "qa",
+})
 
 
 # sha256_of_bytes() removed (Bug I fix): dead function never called; all hashing uses
@@ -286,15 +298,29 @@ def write_report(report: Dict, qa_dir: Path):
 
 
 def scan_repo(root: Path, dry_run: bool = False) -> int:
-    """Scan entire repo. Returns number of failures."""
+    """Scan entire repo. Returns number of failures.
+
+    FIX Bug O: Previously only descended into 'ads-bridge' and 'masters'.
+    Now dynamically discovers all top-level directories that are not date-named
+    and not in _SCAN_SKIP_DIRS, treating them as parents of archive subdirectories.
+    This ensures audition/, covers/, drafts/, screen-inserts/ (and any future
+    content parent directories) are included in integrity checks.
+    """
     failures = 0
     date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
     dirs_to_check = []
     for item in root.iterdir():
-        if item.is_dir() and date_pattern.match(item.name):
+        if not item.is_dir():
+            continue
+        if item.name.startswith("."):
+            continue
+        if date_pattern.match(item.name):
+            # Top-level date directory: check directly
             dirs_to_check.append(item)
-        elif item.is_dir() and item.name in ("ads-bridge", "masters"):
+        elif item.name not in _SCAN_SKIP_DIRS:
+            # FIX Bug O: treat any non-skipped, non-date top-level dir as an
+            # archive parent and descend into its subdirectories.
             for sub in item.iterdir():
                 if sub.is_dir():
                     dirs_to_check.append(sub)
