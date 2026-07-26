@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify_protagonist.py — Protagonist face-identity pre-commit guard for fond-reel-masters.
+verify_protagonist.py – Protagonist face-identity pre-commit guard for fond-reel-masters.
 
 Fixes (historical):
   Bug #4 (CRITICAL): extract_frame_bytes() was called on individual raw .pNNofNN
@@ -23,7 +23,7 @@ Fixes (2026-07-26):
   Fix: use full path relative to repo root (same pattern as verify_integrity.py Bug #2).
 
   Bug F (MEDIUM): make_contact_sheet() converted image to RGB then drew a rectangle
-  with fill=(0, 0, 0, 180) — a 4-tuple RGBA fill on an RGB canvas. PIL silently
+  with fill=(0, 0, 0, 180) – a 4-tuple RGBA fill on an RGB canvas. PIL silently
   drops the alpha channel, producing a solid-black bar instead of a semi-transparent
   overlay. Fix: composite via RGBA then convert back to RGB.
 
@@ -35,6 +35,9 @@ Fixes (2026-07-26):
   Fix: probe actual duration with ffprobe; compute closing_ts dynamically as
   max(1.0, min(probed_duration - 1.0, 30.0)) seconds; split the combined None
   guard into two separate guards with accurate diagnostics.
+
+  Bug L (LOW): Bare parts sorted lexicographically causing part_10 < part_2 for
+  >=10 parts. Fixed with _natural_sort_key() helper.
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
@@ -51,6 +54,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -58,9 +62,21 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# FIX Bug L: Natural sort key helper (module-level)
+# ---------------------------------------------------------------------------
+
+def _natural_sort_key(s: str) -> list:
+    """
+    FIX Bug L: Natural sort key so part_10 sorts after part_2, not before.
+    Splits the string on digit runs and converts digit segments to int.
+    """
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", s)]
+
+
+# ---------------------------------------------------------------------------
 # Perceptual hashing
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
     """
@@ -92,9 +108,9 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
     return 1.0 - (differing / total_bits)
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Video frame extraction
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def get_video_duration(video_path: Path, fallback: float = 30.0) -> float:
     """
@@ -163,9 +179,9 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
                 pass
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Part discovery
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     """
@@ -173,22 +189,25 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
 
     FIX Bug A: Also search the parts/ subdirectory (not just top-level).
     FIX Bug B: Match both part_* and master_part_* naming conventions.
+    FIX Bug L: Sort bare parts with _natural_sort_key to handle >=10 parts.
 
     Returns (all_parts, all_parts) so caller can reassemble and sample at any timestamp.
     Returns ([], []) when no parts are found or only one part exists.
     """
-    import re
-
     # Strategy 1: bare integer-indexed chunks at top level
     # FIX Bug B: include master_part_* as well as part_*
-    bare_parts = sorted(
-        list(directory.glob("part_*")) + list(directory.glob("master_part_*"))
-    )
+    # FIX Bug L: use _natural_sort_key for bare parts sort
+    bare_files = {
+        p.name: p
+        for p in list(directory.glob("part_*")) + list(directory.glob("master_part_*"))
+        if p.is_file()
+    }
+    bare_parts = sorted(bare_files.values(), key=lambda p: _natural_sort_key(p.name))
     if bare_parts:
         if len(bare_parts) == 1:
             print(
                 f"  ⚠️  Only one part found in {directory.name} "
-                "— cannot test protagonist drift. Skipping check."
+                "– cannot test protagonist drift. Skipping check."
             )
             return [], []
         return bare_parts, bare_parts
@@ -220,22 +239,22 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     if len(all_parts) == 1:
         print(
             f"  ⚠️  Only one part found in {directory.name} "
-            "— cannot test protagonist drift. Skipping check."
+            "– cannot test protagonist drift. Skipping check."
         )
         return [], []
 
     return all_parts, all_parts
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Contact sheet generation
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
     """Create a side-by-side contact sheet from labeled frame bytes. Requires PIL.
 
     FIX Bug F: Previously converted image to RGB then drew with fill=(0,0,0,180)
-    — a 4-tuple RGBA fill on an RGB canvas. PIL silently drops the alpha, producing
+    – a 4-tuple RGBA fill on an RGB canvas. PIL silently drops the alpha, producing
     a solid-black bar. Fix: composite via RGBA then convert back to RGB so the
     semi-transparent overlay actually renders correctly.
     """
@@ -269,13 +288,13 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
         print(f"  📸 Contact sheet saved: {output_path}")
 
     except ImportError:
-        print("  ⚠️   PIL not available — skipping contact sheet generation")
+        print("  ⚠️   PIL not available – skipping contact sheet generation")
         print("       pip install pillow")
 
 
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main verification logic
-# ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def verify_protagonist(
     directory: Path,
@@ -289,7 +308,7 @@ def verify_protagonist(
 
     FIX Bug #4 (CRITICAL): Reassemble ALL parts into a single temp MP4 first,
     then extract both frames from the assembled file. Individual .pNNofNN chunks
-    are raw byte splits of the MP4 container — they are NOT independently decodable.
+    are raw byte splits of the MP4 container – they are NOT independently decodable.
     The last chunk (used for closing frame) has no container header and ffmpeg
     always returns None for it, causing every reel to silently pass.
 
@@ -305,7 +324,7 @@ def verify_protagonist(
         return True
 
     print(
-        f"  📂 Found {len(all_parts)} parts: "
+        f"  🔢 Found {len(all_parts)} parts: "
         f"{all_parts[0].name} … {all_parts[-1].name}"
     )
 
@@ -359,13 +378,13 @@ def verify_protagonist(
     if opening_frame is None:
         print("  ⚠️   Could not extract opening frame (ffmpeg not available or file corrupt)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
-        print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        print("  ✅  Check skipped (no ffmpeg) – treating as PASS")
         return True
 
     if closing_frame is None:
         print(f"  ⚠️   Could not extract closing frame at {closing_ts} (seek past EOF or ffmpeg unavailable)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
-        print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        print("  ✅  Check skipped (no ffmpeg) – treating as PASS")
         return True
 
     h_open = _average_hash(opening_frame)
