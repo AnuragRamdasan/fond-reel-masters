@@ -15,7 +15,7 @@ Fixes (historical):
 
   Bug B (HIGH): glob("part_*") missed master_part_* naming convention.
 
-Fixes (2026-07-26):
+Fixes (2026-07-26 batch 1):
   Bug C (CRITICAL): qa_dir fallback used only the date portion of target_dir.name,
   causing all masters/YYYY-MM-DD-* variants (e.g. final, draft, v2) to share the
   same qa/YYYY-MM-DD/ path. Reports from later runs silently overwrote earlier ones,
@@ -38,6 +38,19 @@ Fixes (2026-07-26):
 
   Bug L (LOW): Bare parts sorted lexicographically causing part_10 < part_2 for
   >=10 parts. Fixed with _natural_sort_key() helper.
+
+Fixes (2026-07-26 batch 2):
+  Bug M (MEDIUM): find_parts_in_dir() returned (all_parts, all_parts) — the same
+  list object twice. The caller always discarded the second element with `_` but
+  the misleading 2-tuple signature was a maintenance hazard: any future caller that
+  assigned both values and mutated one would silently corrupt the other.
+  Fix: return a single List[Path]; update caller unpack and docstring.
+
+  Bug N (LOW): extract_frame_bytes() used NamedTemporaryFile(delete=False) + manual
+  os.unlink in finally. A BaseException (KeyboardInterrupt / SystemExit) could bypass
+  the finally and leave an orphaned .jpg in /tmp. On long CI runs this causes
+  disk exhaustion. Fix: use tempfile.TemporaryDirectory which guarantees cleanup
+  regardless of exception type, including BaseException.
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
@@ -144,55 +157,56 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
     """
     Extract a single frame from a video file using ffmpeg.
     Returns JPEG bytes, or None if ffmpeg is not available / extraction fails.
+
+    FIX Bug N: Previously used NamedTemporaryFile(delete=False) + manual os.unlink
+    in a finally block. A BaseException (KeyboardInterrupt, SystemExit) could bypass
+    the finally and leave an orphaned .jpg in /tmp, eventually causing disk exhaustion
+    on CI runners. Now uses tempfile.TemporaryDirectory which guarantees cleanup
+    regardless of exception type.
     """
     import subprocess
 
-    # Initialize tmp_path before try so finally never raises UnboundLocalError
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp_path = tmp.name
-
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-ss", timestamp,
-                "-i", str(video_path),
-                "-vframes", "1",
-                "-q:v", "2",
-                tmp_path,
-            ],
-            capture_output=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-        with open(tmp_path, "rb") as f:
-            return f.read()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "frame.jpg")
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", timestamp,
+                    "-i", str(video_path),
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    tmp_path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                return None
+            with open(tmp_path, "rb") as f:
+                return f.read()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
 # ---------------------------------------------------------------------------
 # Part discovery
 # ---------------------------------------------------------------------------
 
-def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
+def find_parts_in_dir(directory: Path) -> List[Path]:
     """
     Locate all ordered video part files in a directory tree.
 
     FIX Bug A: Also search the parts/ subdirectory (not just top-level).
     FIX Bug B: Match both part_* and master_part_* naming conventions.
     FIX Bug L: Sort bare parts with _natural_sort_key to handle >=10 parts.
+    FIX Bug M: Returns a single List[Path] instead of the misleading
+               Tuple[List[Path], List[Path]] where both elements were
+               the same list object. Callers that used `parts, _ = ...`
+               should change to `parts = ...`.
 
-    Returns (all_parts, all_parts) so caller can reassemble and sample at any timestamp.
-    Returns ([], []) when no parts are found or only one part exists.
+    Returns a sorted list of part paths, or [] when no parts are found or
+    only one part exists (single-part reels cannot test protagonist drift).
     """
     # Strategy 1: bare integer-indexed chunks at top level
     # FIX Bug B: include master_part_* as well as part_*
@@ -209,8 +223,8 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
                 f"  ⚠️  Only one part found in {directory.name} "
                 "– cannot test protagonist drift. Skipping check."
             )
-            return [], []
-        return bare_parts, bare_parts
+            return []
+        return bare_parts
 
     # Strategy 2: .pNNofNN files (top-level AND parts/ subdirectory)
     # FIX Bug A: also search the parts/ subdirectory
@@ -231,7 +245,7 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
                 groups.setdefault(key, []).append((num, f))
 
     if not groups:
-        return [], []
+        return []
 
     best_key = max(groups, key=lambda k: len(groups[k]))
     all_parts = [p for _, p in sorted(groups[best_key], key=lambda x: x[0])]
@@ -241,9 +255,9 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
             f"  ⚠️  Only one part found in {directory.name} "
             "– cannot test protagonist drift. Skipping check."
         )
-        return [], []
+        return []
 
-    return all_parts, all_parts
+    return all_parts
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +328,13 @@ def verify_protagonist(
 
     FIX Bug G (CRITICAL): closing frame timestamp was hardcoded to "00:00:30".
     Now probed dynamically via ffprobe so sub-30s reels are handled correctly.
+
+    FIX Bug M: find_parts_in_dir now returns List[Path] (not a 2-tuple).
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
-    all_parts, _ = find_parts_in_dir(directory)
+    # FIX Bug M: find_parts_in_dir now returns a single List[Path]
+    all_parts = find_parts_in_dir(directory)
 
     if not all_parts:
         print("  ⚠️   No video parts found in directory. Skipping check.")
