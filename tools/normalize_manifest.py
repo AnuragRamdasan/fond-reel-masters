@@ -14,6 +14,14 @@ Fixes (2026-07-26):
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
 
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_*. Directories
+                from the 2026-07-09 era use bare part_0, part_1… naming. The glob
+                returned [], so the emitted manifest had "parts": 0 and
+                "parts_detail": [] → downstream verify_integrity.py saw MISSING PARTS
+                or UNTRACKED failures on every 2026-07-09 era directory.
+                Fix: glob both master_part_* and part_*, deduplicate by filename,
+                sort by name.
+
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
     python tools/normalize_manifest.py --write     # actually write manifests
@@ -77,7 +85,14 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    # FIX Bug H: glob both master_part_* and part_*, deduplicate by filename,
+    # sort by name. Previously only master_part_* was globbed, so 2026-07-09 era
+    # directories using bare part_0, part_1… naming produced an empty parts_detail.
+    seen = {}
+    for pf in list(directory.glob("master_part_*")) + list(directory.glob("part_*")):
+        seen[pf.name] = pf
+    part_files = sorted(seen.values(), key=lambda p: p.name)
+
     parts_info = []
     for pf in part_files:
         parts_info.append({
@@ -261,7 +276,7 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("👁 DRY RUN – pass --write to apply changes\n")
+        print("💁 DRY RUN – pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
