@@ -42,6 +42,15 @@ Fixes (2026-07-26 batch 3):
                 absolute path string — non-deterministic across environments
                 (developer vs CI). Fix: sort by relative_to(root).
 
+Fixes (2026-07-26 batch 4):
+  Bug S (HIGH): normalise_reel_manifest() sorted parts with key=lambda p: p.name
+                (plain alphabetic), so part_10 sorted before part_2 for archives
+                with >=10 parts. The _natural_sort_key helper was already present
+                in verify_integrity.py and verify_protagonist.py (Bug L fix) but
+                was never ported to this file.
+                Fix: add module-level _natural_sort_key() and use it in
+                normalise_reel_manifest() sort call.
+
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
     python tools/normalize_manifest.py --write     # actually write manifests
@@ -66,6 +75,21 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _SCAN_SKIP_DIRS = frozenset({
     ".github", ".git", "tools", "docs", "qa",
 })
+
+
+# ---------------------------------------------------------------------------
+# FIX Bug S: Natural sort key helper (module-level)
+# ---------------------------------------------------------------------------
+
+def _natural_sort_key(s: str) -> list:
+    """
+    FIX Bug S: Natural sort key so part_10 sorts after part_2, not before.
+    Splits the string on digit runs and converts digit segments to int.
+    Identical to the helper already present in verify_integrity.py and
+    verify_protagonist.py (Bug L fix); ported here to fix the same defect
+    in normalise_reel_manifest().
+    """
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", s)]
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +139,18 @@ def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     FIX Bug H: previously only globbed master_part_*, missing the bare part_*
     naming convention used by 2026-07-09-era directories. Now globs both patterns
     and merges by filename to avoid duplicates.
+
+    FIX Bug S: previously sorted with key=lambda p: p.name (alphabetic), causing
+    part_10 to sort before part_2 for archives with >=10 parts. Now uses
+    _natural_sort_key for correct numeric ordering.
     """
     # FIX Bug H: glob both master_part_* and part_*; name-keyed dict merge
-    # deduplicates entries that might match both patterns, then sort by filename.
+    # deduplicates entries that might match both patterns.
+    # FIX Bug S: sort with _natural_sort_key instead of plain p.name so that
+    # part_10 comes after part_9, not before part_2.
     part_files = sorted(
         {p.name: p for p in list(directory.glob("master_part_*")) + list(directory.glob("part_*"))}.values(),
-        key=lambda p: p.name,
+        key=lambda p: _natural_sort_key(p.name),
     )
     parts_info = []
     for pf in part_files:

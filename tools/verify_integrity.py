@@ -24,6 +24,11 @@ Fixes:
                unprotected by integrity checks. Fixed with dynamic parent discovery:
                any top-level directory that is not date-named AND not in a known-skip
                set is treated as a parent of archive subdirectories.
+  Bug U (LOW): scan_repo() used sorted(dirs_to_check) which compares Path objects by
+               absolute path string — non-deterministic across environments (developer
+               vs CI). The identical fix was applied to normalize_manifest.py as Bug R
+               (batch 3) but not ported here.
+               Fix: sort by relative_to(root) for reproducible output.
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
@@ -305,6 +310,11 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
     and not in _SCAN_SKIP_DIRS, treating them as parents of archive subdirectories.
     This ensures audition/, covers/, drafts/, screen-inserts/ (and any future
     content parent directories) are included in integrity checks.
+
+    FIX Bug U: Previously used sorted(dirs_to_check) which compares Path objects
+    by absolute path string — non-deterministic across environments. Now sorts by
+    relative_to(root) for reproducible, human-readable output. Mirrors the Bug R
+    fix already applied to normalize_manifest.py scan_all().
     """
     failures = 0
     date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -325,7 +335,9 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
                 if sub.is_dir():
                     dirs_to_check.append(sub)
 
-    for d in sorted(dirs_to_check):
+    # FIX Bug U: sort by relative path for deterministic output across envs.
+    # Previously: sorted(dirs_to_check) — compared by absolute path string.
+    for d in sorted(dirs_to_check, key=lambda p: p.relative_to(root)):
         print(f"\n\U0001f4c1 Checking: {d}")
         report = verify_directory(d, dry_run=dry_run)
 
