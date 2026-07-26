@@ -6,6 +6,9 @@ Fixes:
   Bug #1 (CRITICAL): manifest_missing not counted in exit code → silent CI pass
   Bug #2 (HIGH): QA report collision when same-named dirs exist under different parents
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
+  Bug I (LOW): Dead sha256_of_bytes() function removed — it was never called and
+               loading multi-GB video files into memory would OOM the process. All
+               hashing uses the streaming sha256_of_parts() below.
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
@@ -28,8 +31,8 @@ PART_RE = re.compile(r"^(.+)\.p(\d{2})of(\d{2})$")
 CHUNK_SIZE = 65536  # 64 KB read buffer
 
 
-def sha256_of_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# sha256_of_bytes() removed (Bug I fix): dead function never called; all hashing uses
+# the streaming sha256_of_parts() below to avoid loading multi-GB files into memory.
 
 
 def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
