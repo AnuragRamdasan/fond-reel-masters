@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-normalize_manifest.py – Manifest schema normalizer for fond-reel-masters.
+normalize_manifest.py — Manifest schema normalizer for fond-reel-masters.
 
 Fixes (historical):
   Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
@@ -13,6 +13,14 @@ Fixes (2026-07-26):
                 process_directory(), which called directory.rglob("*") on a file
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
+
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_*. Directories
+                using bare part_0, part_1... naming (common in 2026-07-09 era)
+                produced an empty parts_detail list, so the emitted manifest silently
+                reported parts: 0 → downstream verify_integrity.py saw MISSING PARTS
+                or UNTRACKED failures on the next CI run.
+                Fix: glob both master_part_* and part_*, deduplicate by filename,
+                sort by name.
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -34,9 +42,9 @@ SCHEMA_VERSION = 2
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # Schema detection
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     """
@@ -56,7 +64,7 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
         if "date" in data and "arm" in data and isinstance(data.get("parts"), int):
             return 1, data  # 1a
         # Ads-bridge manifest: values are dicts with sha256/bytes/parts
-        # FIX Bug #3: guard against empty JSON {} – all() over empty iterable
+        # FIX Bug #3: guard against empty JSON {} — all() over empty iterable
         # returns True (vacuous truth), causing {} to be misdetected as schema 1b.
         if data and all(isinstance(v, dict) for v in data.values()):
             return 11, data  # 1b
@@ -71,13 +79,27 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     return 0, None  # missing
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # Normalisation functions
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
-    """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    """Schema 1a → Schema 2.
+
+    FIX Bug H: Previously only globbed master_part_*. Directories using bare
+    part_0, part_1... naming (common in 2026-07-09 era) produced an empty
+    parts_detail list → manifest silently reported parts: 0 → downstream
+    verify_integrity.py saw MISSING PARTS or UNTRACKED failures.
+
+    Fix: glob both master_part_* and part_*, deduplicate by filename, sort by name.
+    """
+    # Collect both naming conventions, deduplicate by filename, sort by name
+    seen = {}
+    for pf in list(directory.glob("master_part_*")) + list(directory.glob("part_*")):
+        if pf.is_file() and pf.name not in seen:
+            seen[pf.name] = pf
+    part_files = sorted(seen.values(), key=lambda p: p.name)
+
     parts_info = []
     for pf in part_files:
         parts_info.append({
@@ -168,9 +190,9 @@ def create_empty_manifest(directory: Path) -> Dict:
     }
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 # Main scan
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 def process_directory(directory: Path, write: bool = False) -> bool:
     """
@@ -261,7 +283,7 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("👁 DRY RUN – pass --write to apply changes\n")
+        print("👁 DRY RUN — pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
