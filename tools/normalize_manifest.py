@@ -6,7 +6,7 @@ Fixes (historical):
   Bug #3 (HIGH): Empty JSON {} misdetected as ads-bridge schema 1b due to
                  Python's all() returning True over an empty iterable (vacuous truth).
 
-Fixes (2026-07-26):
+Fixes (2026-07-26 batch 1):
   Bug D (HIGH): scan_all() iterated over p.iterdir() for ads-bridge/ and masters/
                 without filtering to directories only. Loose files (README.md,
                 .gitignore, etc.) were appended to dirs and passed to
@@ -22,6 +22,25 @@ Fixes (2026-07-26):
                 failures for every one of them.
                 Fix: glob both master_part_* and part_*; use a name-keyed dict
                 merge to avoid duplicates, then sort by filename.
+
+Fixes (2026-07-26 batch 3):
+  Bug P (HIGH): scan_all() hard-coded only ("ads-bridge", "masters") as parent
+                directories to descend into. audition/, covers/, drafts/, and
+                screen-inserts/ were silently skipped, leaving their manifests
+                un-migrated. This mirrors Bug O already fixed in verify_integrity.py
+                but not ported here.
+                Fix: dynamic discovery using _SCAN_SKIP_DIRS, same as verify_integrity.py.
+
+  Bug Q (MEDIUM): create_empty_manifest() used rglob("*") and excluded known
+                suffixes (.jpg, .png, .json, .txt, .md) but not .bak. After any
+                --write run, manifest.json.bak accumulates in the directory and is
+                counted as a video part, inflating "parts" and "size_bytes" in the
+                generated stub. verify_integrity.py then reports MISSING PARTS.
+                Fix: add ".bak" to the suffix exclusion tuple.
+
+  Bug R (LOW):  scan_all() used sorted(dirs) which compares Path objects by
+                absolute path string — non-deterministic across environments
+                (developer vs CI). Fix: sort by relative_to(root).
 
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
@@ -41,6 +60,12 @@ from typing import Dict, List, Optional, Tuple
 
 SCHEMA_VERSION = 2
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+# FIX Bug P: directories that should never be treated as archive parents.
+# Mirrors the _SCAN_SKIP_DIRS frozenset in verify_integrity.py (Bug O fix).
+_SCAN_SKIP_DIRS = frozenset({
+    ".github", ".git", "tools", "docs", "qa",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +190,11 @@ def create_empty_manifest(directory: Path) -> Dict:
 
     # FIX Bug #6: `not p.suffix in (...)` parses as `(not p.suffix) in (...)`
     # due to operator precedence, inverting the filter. Use `p.suffix not in (...)`.
+    # FIX Bug Q: add ".bak" to excluded suffixes so manifest.json.bak backup
+    # files left by --write runs are not counted as video parts.
     parts_detail = []
     for p in sorted(directory.rglob("*")):
-        if p.is_file() and p.suffix not in (".jpg", ".png", ".json", ".txt", ".md"):
+        if p.is_file() and p.suffix not in (".jpg", ".png", ".json", ".txt", ".md", ".bak"):
             parts_detail.append({
                 "file": str(p.relative_to(directory)),
                 "bytes": p.stat().st_size,
@@ -240,27 +267,40 @@ def process_directory(directory: Path, write: bool = False) -> bool:
 
 
 def scan_all(root: Path, write: bool = False) -> int:
-    """Scan entire repo. Returns count of directories processed."""
+    """Scan entire repo. Returns count of directories processed.
+
+    FIX Bug D: add `if sub.is_dir()` guard to avoid passing loose files to
+    process_directory().
+
+    FIX Bug P: dynamically discover all top-level archive parent directories
+    instead of hard-coding only "ads-bridge" and "masters". Any top-level dir
+    that is not date-named AND not in _SCAN_SKIP_DIRS is treated as a parent
+    of archive subdirectories. Mirrors Bug O fix in verify_integrity.py.
+
+    FIX Bug R: sort by relative_to(root) instead of absolute path for
+    deterministic, human-readable output across all environments.
+    """
     count = 0
     dirs = []
 
     for item in root.iterdir():
-        if item.is_dir() and DATE_RE.match(item.name):
+        if not item.is_dir():
+            continue
+        if item.name.startswith("."):
+            continue
+        if DATE_RE.match(item.name):
+            # Top-level date directory: check directly
             dirs.append(item)
-
-    # FIX Bug D: add `if sub.is_dir()` guard. Previously, p.iterdir() yielded
-    # all entries including loose files (README.md, .gitignore, etc.). Passing a
-    # file path to process_directory() caused detect_schema() to look for
-    # "file/manifest.json" (never exists), then create_empty_manifest() to call
-    # directory.rglob("*") on a file → NotADirectoryError in Python 3.11+.
-    for parent in ["ads-bridge", "masters"]:
-        p = root / parent
-        if p.exists():
-            for sub in p.iterdir():
-                if sub.is_dir():  # FIX Bug D: only append actual directories
+        elif item.name not in _SCAN_SKIP_DIRS:
+            # FIX Bug P: treat any non-skipped, non-date top-level dir as an
+            # archive parent and descend into its subdirectories.
+            # FIX Bug D: only append actual directories (if sub.is_dir() guard).
+            for sub in item.iterdir():
+                if sub.is_dir():  # FIX Bug D
                     dirs.append(sub)
 
-    for d in sorted(dirs):
+    # FIX Bug R: sort by relative path for deterministic output across envs.
+    for d in sorted(dirs, key=lambda p: p.relative_to(root)):
         print(f"\n📁 {d.relative_to(root)}")
         changed = process_directory(d, write=write)
         if changed:
