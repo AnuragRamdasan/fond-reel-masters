@@ -52,6 +52,17 @@ Fixes (2026-07-26 batch 2):
   disk exhaustion. Fix: use tempfile.TemporaryDirectory which guarantees cleanup
   regardless of exception type, including BaseException.
 
+Fixes (2026-07-26 batch 4):
+  Bug T (MEDIUM): verify_protagonist() assembly loop used part.read_bytes() to load
+  each entire video part (typically 250-600 MB) as a Python bytes object before
+  writing it to the temp MP4. On a 3-part reel this peaks RAM at 2x the largest
+  part size. On memory-constrained CI runners this triggers an OOM kill with no
+  diagnostic output, making the pre-commit hook silently disappear.
+  The same pattern was flagged as Bug I (sha256_of_bytes) in batch 2 but the
+  assembly loop was not updated at the same time.
+  Fix: replace part.read_bytes() with a chunked copy using COPY_CHUNK (8 MB)
+  so peak RAM usage is bounded at 8 MB regardless of part or reel size.
+
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
     python tools/verify_protagonist.py --dir masters/2026-07-24-final --threshold 0.80
@@ -73,6 +84,11 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+# FIX Bug T: 8 MB read buffer for chunked part assembly — keeps peak RAM
+# usage constant regardless of individual part size or total reel size.
+COPY_CHUNK = 8 * 1024 * 1024  # 8 MB
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +346,9 @@ def verify_protagonist(
     Now probed dynamically via ffprobe so sub-30s reels are handled correctly.
 
     FIX Bug M: find_parts_in_dir now returns List[Path] (not a 2-tuple).
+
+    FIX Bug T: assembly loop now uses chunked copy (COPY_CHUNK = 8 MB) instead
+    of part.read_bytes() to prevent OOM on large multi-part reels.
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
@@ -364,8 +383,16 @@ def verify_protagonist(
 
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             assembled_path = Path(tmp.name)
+            # FIX Bug T: use chunked copy instead of part.read_bytes() to avoid
+            # loading entire parts (250-600 MB each) into RAM all at once.
+            # Peak memory usage is now COPY_CHUNK (8 MB) regardless of reel size.
             for part in all_parts:
-                tmp.write(part.read_bytes())
+                with open(part, "rb") as src:
+                    while True:
+                        chunk = src.read(COPY_CHUNK)
+                        if not chunk:
+                            break
+                        tmp.write(chunk)
 
         # FIX Bug G: probe actual duration; compute a safe closing timestamp
         # so we never seek past EOF on sub-30s reels.
