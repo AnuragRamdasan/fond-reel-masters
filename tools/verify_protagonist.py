@@ -27,6 +27,16 @@ Fixes (2026-07-26):
   drops the alpha channel, producing a solid-black bar instead of a semi-transparent
   overlay. Fix: composite via RGBA then convert back to RGB.
 
+  Bug G (CRITICAL): Closing frame timestamp hardcoded to "00:00:30". For any reel
+  shorter than 30s, ffmpeg -ss 00:00:30 seeks past EOF → extract_frame_bytes()
+  returns None → the combined `opening_frame is None or closing_frame is None` guard
+  prints "ffmpeg not available" and returns True (PASS). Every sub-30s reel silently
+  bypassed protagonist identity checking. Given typical Veo clip lengths of 6-8s, a
+  3-clip reel (~20s total) is the most common production case.
+  Fix: probe actual assembled duration via ffprobe → compute closing_ts dynamically
+  as max(1s, min(duration-1s, 30s)). Split combined or guard into two distinct
+  diagnostic branches. Add probed_duration_seconds to QA JSON report.
+
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
     python tools/verify_protagonist.py --dir masters/2026-07-24-final --threshold 0.80
@@ -49,9 +59,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Perceptual hashing
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def _average_hash(image_bytes: bytes, hash_size: int = 8) -> int:
     """
@@ -83,9 +93,43 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
     return 1.0 - (differing / total_bits)
 
 
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Video frame extraction
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
+
+def get_video_duration(video_path: Path) -> Optional[float]:
+    """
+    FIX Bug G: Probe actual video duration in seconds via ffprobe.
+    Returns None if ffprobe is unavailable or the file cannot be probed.
+
+    Used to compute a safe closing timestamp that never exceeds the file's
+    actual duration (which would cause ffmpeg to return no frames).
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            timeout=15,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
+def _seconds_to_ts(secs: float) -> str:
+    """Convert a float number of seconds to HH:MM:SS timestamp string."""
+    s = int(secs)
+    return "{:02d}:{:02d}:{:02d}".format(s // 3600, (s % 3600) // 60, s % 60)
+
 
 def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Optional[bytes]:
     """
@@ -126,9 +170,9 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
                 pass
 
 
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Part discovery
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     """
@@ -150,7 +194,7 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     if bare_parts:
         if len(bare_parts) == 1:
             print(
-                f"  ⚠️  Only one part found in {directory.name} "
+                f"  ⚠️   Only one part found in {directory.name} "
                 "— cannot test protagonist drift. Skipping check."
             )
             return [], []
@@ -182,7 +226,7 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
 
     if len(all_parts) == 1:
         print(
-            f"  ⚠️  Only one part found in {directory.name} "
+            f"  ⚠️   Only one part found in {directory.name} "
             "— cannot test protagonist drift. Skipping check."
         )
         return [], []
@@ -190,9 +234,9 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     return all_parts, all_parts
 
 
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Contact sheet generation
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
     """Create a side-by-side contact sheet from labeled frame bytes. Requires PIL.
@@ -236,9 +280,9 @@ def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
         print("       pip install pillow")
 
 
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Main verification logic
-# ---------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def verify_protagonist(
     directory: Path,
@@ -255,6 +299,13 @@ def verify_protagonist(
     are raw byte splits of the MP4 container — they are NOT independently decodable.
     The last chunk (used for closing frame) has no container header and ffmpeg
     always returns None for it, causing every reel to silently pass.
+
+    FIX Bug G (CRITICAL): Closing frame timestamp was hardcoded to "00:00:30".
+    For any reel shorter than 30s, ffmpeg seeks past EOF → extract_frame_bytes()
+    returns None → the combined `or` guard prints "ffmpeg not available" and
+    returns True (PASS). Every sub-30s reel silently bypassed protagonist identity
+    checking. Fix: probe actual assembled duration via ffprobe → compute closing_ts
+    dynamically. Split combined or guard into two distinct diagnostic branches.
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
@@ -274,11 +325,13 @@ def verify_protagonist(
     assembled_path: Optional[Path] = None
     opening_frame: Optional[bytes] = None
     closing_frame: Optional[bytes] = None
+    closing_ts: str = "00:00:30"  # default; overridden after probing
+    probed_duration: Optional[float] = None
 
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
         print(
-            f"  🔗 Reassembling {len(all_parts)} parts "
+            f"  📗 Reassembling {len(all_parts)} parts "
             f"({total_bytes / 1_048_576:.1f} MB)…"
         )
 
@@ -287,11 +340,26 @@ def verify_protagonist(
             for part in all_parts:
                 tmp.write(part.read_bytes())
 
+        # FIX Bug G: probe the actual assembled duration so we never seek past EOF.
+        probed_duration = get_video_duration(assembled_path)
+        if probed_duration is not None:
+            closing_secs = max(1.0, min(probed_duration - 1.0, 30.0))
+            closing_ts = _seconds_to_ts(closing_secs)
+            print(
+                f"  ⏱️   Probed duration: {probed_duration:.1f}s → "
+                f"closing timestamp: {closing_ts}"
+            )
+        else:
+            print(
+                "  ⚠️   ffprobe unavailable — falling back to closing timestamp 00:00:30. "
+                "Sub-30s reels may have no closing frame."
+            )
+
         print("  🎞️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        print("  🎞️   Extracting closing frame (t=00:00:30)…")
-        closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
+        print(f"  🎞️   Extracting closing frame (t={closing_ts})…")
+        closing_frame = extract_frame_bytes(assembled_path, closing_ts)
 
     finally:
         if assembled_path is not None:
@@ -300,24 +368,37 @@ def verify_protagonist(
             except OSError:
                 pass
 
-    if opening_frame is None or closing_frame is None:
-        print("  ⚠️   Could not extract frames (ffmpeg not available or file corrupt)")
+    # FIX Bug G: split the combined `or` guard into two distinct diagnostic branches.
+    # Previously both cases printed "ffmpeg not available" and returned PASS, masking
+    # the real cause (closing timestamp past EOF for sub-30s reels).
+    if opening_frame is None:
+        print("  ⚠️   Could not extract opening frame (ffmpeg not available or file corrupt)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
         print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        return True
+
+    if closing_frame is None:
+        print(
+            f"  ⚠️   Could not extract closing frame at t={closing_ts} "
+            f"(file may be corrupt or duration probe failed)"
+        )
+        print("  ℹ️   Ensure ffmpeg and ffprobe are installed and the video is decodable")
+        print("  ✅  Check skipped — treating as PASS")
         return True
 
     h_open = _average_hash(opening_frame)
     h_close = _average_hash(closing_frame)
     similarity = hash_similarity(h_open, h_close)
 
-    print(f"  🔬 Face similarity score: {similarity:.3f} (threshold: {threshold:.2f})")
+    print(f"  👁 Face similarity score: {similarity:.3f} (threshold: {threshold:.2f})")
 
     if qa_dir:
         sheet_path = qa_dir / "diag_faces.jpg"
         make_contact_sheet(
             [
                 (f"OPENING t=00:00:01\n{all_parts[0].name}", opening_frame),
-                (f"CLOSING t=00:00:30\n{all_parts[-1].name}", closing_frame),
+                # FIX Bug G: use actual closing_ts in contact sheet label
+                (f"CLOSING t={closing_ts}\n{all_parts[-1].name}", closing_frame),
             ],
             sheet_path,
         )
@@ -328,7 +409,10 @@ def verify_protagonist(
         "opening_part": all_parts[0].name,
         "closing_part": all_parts[-1].name,
         "opening_timestamp": "00:00:01",
-        "closing_timestamp": "00:00:30",
+        # FIX Bug G: record actual closing timestamp used, not hardcoded "00:00:30"
+        "closing_timestamp": closing_ts,
+        # FIX Bug G: include probed duration for auditability
+        "probed_duration_seconds": probed_duration,
         "similarity": round(similarity, 4),
         "threshold": threshold,
         "passed": similarity >= threshold or skip_check,
