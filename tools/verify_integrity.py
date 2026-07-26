@@ -6,15 +6,24 @@ Fixes:
   Bug #1 (CRITICAL): manifest_missing not counted in exit code → silent CI pass
   Bug #2 (HIGH): QA report collision when same-named dirs exist under different parents
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
-  Bug I (LOW): Dead sha256_of_bytes() function removed — it was never called and
+  Bug I (LOW): Dead sha256_of_bytes() function removed – it was never called and
                loading multi-GB video files into memory would OOM the process. All
                hashing uses the streaming sha256_of_parts() below.
+  Bug J (HIGH): collect_parts() silently misses bare part_* / master_part_* files
+               (2026-07-09-era directories). Now also globs bare parts under a
+               "__bare__" sentinel key and reconciles in verify_directory().
+  Bug K (MEDIUM): Schema-2 reel manifests skipped SHA256 verification silently.
+               assets = manifest.get("assets", {}) returns {} for reel manifests
+               that have no "assets" key. Now falls through to the sha256/parts
+               branch for single-asset reel manifests.
+  Bug L (LOW): Lexicographic sort orders part_10 before part_2 for >=10 parts.
+               Fixed with _natural_sort_key() helper using re.split on digit runs.
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
-    python tools/verify_integrity.py --all           # scan entire repo
-    python tools/verify_integrity.py --dry-run       # report only, no writes
-"""
+    python tools/verify_integrity.py --all            # scan entire repo
+    python tools/verify_integrity.py --dry-run        # report only, no writes
+!min
 
 import argparse
 import hashlib
@@ -35,6 +44,14 @@ CHUNK_SIZE = 65536  # 64 KB read buffer
 # the streaming sha256_of_parts() below to avoid loading multi-GB files into memory.
 
 
+def _natural_sort_key(s: str) -> list:
+    """
+    FIX Bug L: Natural sort key so part_10 sorts after part_2, not before.
+    Splits the string on digit runs and converts digit segments to int.
+    """
+    return [int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", s)]
+
+
 def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
     """Compute SHA256 and total byte count across ordered part files."""
     h = hashlib.sha256()
@@ -52,6 +69,12 @@ def collect_parts(directory: Path) -> Dict[str, List[Path]]:
     Walk a directory and group .pNNofNN files by logical filename.
     Single-chunk files (p01of01) are included.
     Returns dict: logical_name -> sorted list of part paths.
+
+    FIX Bug J: Also globs bare part_* / master_part_* files (2026-07-09-era
+    directories). These are collected under the sentinel key "__bare__" so
+    verify_directory() can reconcile them against the manifest.
+
+    FIX Bug L: Bare parts are sorted with _natural_sort_key to handle >=10 parts.
     """
     groups: Dict[str, List[Tuple[int, int, Path]]] = defaultdict(list)
     for f in directory.rglob("*"):
@@ -73,6 +96,17 @@ def collect_parts(directory: Path) -> Dict[str, List[Path]]:
         if len(entries) != expected_total:
             print(f"  ⚠️   WARN: expected {expected_total} parts for {logical_name}, found {len(entries)}")
         result[logical_name] = [e[2] for e in entries]
+
+    # FIX Bug J: collect bare part_* and master_part_* files (files only, no subdirs)
+    # Use a name-keyed dict merge to deduplicate across both globs.
+    bare_files = list(
+        {p.name: p for p in list(directory.glob("part_*")) + list(directory.glob("master_part_*"))
+         if p.is_file()}.values()
+    )
+    if bare_files:
+        # FIX Bug L: sort bare parts with natural sort key
+        result["__bare__"] = sorted(bare_files, key=lambda p: _natural_sort_key(p.name))
+
     return result
 
 
@@ -109,10 +143,22 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
         report["manifest_missing"] = True
         print(f"  ⚠️   No manifest.json in {directory}")
         for logical_name, part_files in parts_map.items():
+            if logical_name == "__bare__":
+                continue
             digest, total_bytes = sha256_of_parts(part_files)
             report["untracked_files"].append({
                 "logical_name": logical_name,
                 "parts": len(part_files),
+                "bytes": total_bytes,
+                "sha256": digest,
+            })
+        # Also report bare parts if no manifest
+        if "__bare__" in parts_map:
+            bare = parts_map["__bare__"]
+            digest, total_bytes = sha256_of_parts(bare)
+            report["untracked_files"].append({
+                "logical_name": "__bare__",
+                "parts": len(bare),
                 "bytes": total_bytes,
                 "sha256": digest,
             })
@@ -122,6 +168,17 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
 
     if schema >= 2:
         assets = manifest.get("assets", {})
+        # FIX Bug K: schema-2 reel manifests have no "assets" key but DO have a
+        # top-level "sha256". The old code returned {} and skipped verification.
+        # Now we fall through to build a single-asset dict just like schema-1a.
+        if not assets and "sha256" in manifest:
+            assets = {
+                manifest.get("date", "reel"): {
+                    "sha256": manifest["sha256"],
+                    "bytes": manifest.get("size_bytes", manifest.get("size", 0)),
+                    "parts": manifest.get("parts", 1),
+                }
+            }
     elif "sha256" in manifest and "parts" in manifest:
         assets = {
             manifest.get("date", "reel"): {
@@ -132,6 +189,29 @@ def verify_directory(directory: Path, dry_run: bool = False) -> Dict:
         }
     else:
         assets = {k: v for k, v in manifest.items() if isinstance(v, dict) and "sha256" in v}
+
+    # FIX Bug J: reconcile __bare__ sentinel against manifest keys.
+    # For the common single-asset reel case: if exactly one manifest key has no
+    # corresponding pNNofNN group, map __bare__ to that manifest key.
+    if "__bare__" in parts_map:
+        bare_files = parts_map.pop("__bare__")
+        manifest_keys_set = set(assets.keys())
+        pNNofNN_keys_set = set(parts_map.keys())
+        unmatched_manifest = manifest_keys_set - pNNofNN_keys_set
+        if len(unmatched_manifest) == 1:
+            # Unambiguous: map bare files to the one unmatched manifest key
+            sole_key = next(iter(unmatched_manifest))
+            parts_map[sole_key] = bare_files
+        else:
+            # Ambiguous or all manifest keys already matched: treat as untracked
+            digest, total_bytes = sha256_of_parts(bare_files)
+            report["untracked_files"].append({
+                "logical_name": "__bare__",
+                "parts": len(bare_files),
+                "bytes": total_bytes,
+                "sha256": digest,
+            })
+            print(f"  ⚠️   UNTRACKED (bare): could not unambiguously map bare parts to manifest key")
 
     manifest_keys = set(assets.keys())
     parts_keys = set(parts_map.keys())
