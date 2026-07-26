@@ -27,6 +27,14 @@ Fixes (2026-07-26):
   drops the alpha channel, producing a solid-black bar instead of a semi-transparent
   overlay. Fix: composite via RGBA then convert back to RGB.
 
+  Bug G (CRITICAL): The closing frame timestamp was hardcoded to "00:00:30". For
+  reels shorter than 30s (the common case with 3x6-8s Veo clips = ~20s), ffmpeg
+  seeks past EOF and extract_frame_bytes() returns None. The combined or guard then
+  prints "ffmpeg not available" and returns True (silent PASS). Every sub-30s reel
+  was silently skipping protagonist checking.
+  Fix: probe actual duration via ffprobe and compute a valid closing timestamp
+  dynamically. Split the combined or-guard so each None case gets its own message.
+
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
     python tools/verify_protagonist.py --dir masters/2026-07-24-final --threshold 0.80
@@ -124,6 +132,31 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def get_video_duration(video_path: Path) -> float:
+    """
+    Probe the duration of a video file using ffprobe.
+    Returns duration in seconds, or 30.0 as a safe fallback if ffprobe is unavailable.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return 30.0
 
 
 # ---------------------------------------------------------------------------------
@@ -255,6 +288,12 @@ def verify_protagonist(
     are raw byte splits of the MP4 container — they are NOT independently decodable.
     The last chunk (used for closing frame) has no container header and ffmpeg
     always returns None for it, causing every reel to silently pass.
+
+    FIX Bug G (CRITICAL): The closing frame timestamp was hardcoded to "00:00:30".
+    For sub-30s reels, ffmpeg seeks past EOF and returns None, which the combined
+    or-guard treated as "no ffmpeg" → silent PASS. Fix: probe actual duration via
+    ffprobe to compute a valid closing timestamp. Also split the or-guard so each
+    None case emits an accurate diagnostic message.
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
@@ -275,6 +314,12 @@ def verify_protagonist(
     opening_frame: Optional[bytes] = None
     closing_frame: Optional[bytes] = None
 
+    # Bug G fix: initialise closing_ts and probed_duration before the try block
+    # so they are accessible in the report dict even if an exception is raised
+    # partway through (and so the or-guard error messages can reference closing_ts).
+    closing_ts: str = "00:00:30"
+    probed_duration: float = 30.0
+
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
         print(
@@ -290,8 +335,12 @@ def verify_protagonist(
         print("  🎞️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        print("  🎞️   Extracting closing frame (t=00:00:30)…")
-        closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
+        # Bug G fix: probe actual duration so sub-30s reels get a valid closing timestamp
+        probed_duration = get_video_duration(assembled_path)
+        closing_ts_secs = max(1.0, min(probed_duration - 1.0, 30.0))
+        closing_ts = f"{int(closing_ts_secs // 3600):02d}:{int((closing_ts_secs % 3600) // 60):02d}:{int(closing_ts_secs % 60):02d}"
+        print(f"  🎞️   Extracting closing frame (t={closing_ts}, probed_duration={probed_duration:.1f}s)…")
+        closing_frame = extract_frame_bytes(assembled_path, closing_ts)
 
     finally:
         if assembled_path is not None:
@@ -300,10 +349,19 @@ def verify_protagonist(
             except OSError:
                 pass
 
-    if opening_frame is None or closing_frame is None:
-        print("  ⚠️   Could not extract frames (ffmpeg not available or file corrupt)")
+    # Bug G fix: split the combined or-guard so each None case gets an accurate
+    # diagnostic message. Previously both cases printed "ffmpeg not available"
+    # even when the real cause was a seek-past-EOF on a sub-30s reel.
+    if opening_frame is None:
+        print("  ⚠️   Could not extract opening frame (ffmpeg not available or file corrupt)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
-        print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        print("  ✅  Check skipped (no opening frame) — treating as PASS")
+        return True
+
+    if closing_frame is None:
+        print(f"  ⚠️   Could not extract closing frame at t={closing_ts} — reel may be shorter than expected")
+        print("  ℹ️   Install ffmpeg or check reel duration")
+        print("  ✅  Check skipped (no closing frame) — treating as PASS")
         return True
 
     h_open = _average_hash(opening_frame)
@@ -317,7 +375,7 @@ def verify_protagonist(
         make_contact_sheet(
             [
                 (f"OPENING t=00:00:01\n{all_parts[0].name}", opening_frame),
-                (f"CLOSING t=00:00:30\n{all_parts[-1].name}", closing_frame),
+                (f"CLOSING t={closing_ts}\n{all_parts[-1].name}", closing_frame),
             ],
             sheet_path,
         )
@@ -328,7 +386,8 @@ def verify_protagonist(
         "opening_part": all_parts[0].name,
         "closing_part": all_parts[-1].name,
         "opening_timestamp": "00:00:01",
-        "closing_timestamp": "00:00:30",
+        "closing_timestamp": closing_ts,
+        "probed_duration_seconds": round(probed_duration, 2),
         "similarity": round(similarity, 4),
         "threshold": threshold,
         "passed": similarity >= threshold or skip_check,
