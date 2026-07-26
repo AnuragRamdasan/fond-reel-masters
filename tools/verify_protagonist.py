@@ -27,6 +27,15 @@ Fixes (2026-07-26):
   drops the alpha channel, producing a solid-black bar instead of a semi-transparent
   overlay. Fix: composite via RGBA then convert back to RGB.
 
+  Bug G (CRITICAL): closing frame timestamp was hardcoded to "00:00:30". Typical
+  fond-reel-masters reels are 3 x 6-8s Veo clips approx 18-24s total. For any reel
+  shorter than 30s, ffmpeg seeks past EOF and extract_frame_bytes() returns None.
+  The combined or-guard then silently returned True (PASS). Protagonist identity
+  checking was completely non-functional for the majority of reels.
+  Fix: probe actual duration with ffprobe; compute closing_ts dynamically as
+  max(1.0, min(probed_duration - 1.0, 30.0)) seconds; split the combined None
+  guard into two separate guards with accurate diagnostics.
+
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
     python tools/verify_protagonist.py --dir masters/2026-07-24-final --threshold 0.80
@@ -86,6 +95,34 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
 # ---------------------------------------------------------------------------------
 # Video frame extraction
 # ---------------------------------------------------------------------------------
+
+def get_video_duration(video_path: Path, fallback: float = 30.0) -> float:
+    """
+    FIX Bug G: Probe the actual duration of a video file using ffprobe.
+    Returns duration in seconds, or `fallback` (30.0s) if ffprobe is
+    unavailable or fails. Used to compute a safe closing-frame timestamp
+    instead of the old hardcoded "00:00:30" that caused seeks past EOF
+    on sub-30s reels.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            timeout=15,
+            text=True,
+        )
+        if result.returncode == 0:
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return fallback
+
 
 def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Optional[bytes]:
     """
@@ -255,6 +292,9 @@ def verify_protagonist(
     are raw byte splits of the MP4 container — they are NOT independently decodable.
     The last chunk (used for closing frame) has no container header and ffmpeg
     always returns None for it, causing every reel to silently pass.
+
+    FIX Bug G (CRITICAL): closing frame timestamp was hardcoded to "00:00:30".
+    Now probed dynamically via ffprobe so sub-30s reels are handled correctly.
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
@@ -271,9 +311,13 @@ def verify_protagonist(
 
     # FIX Bug #4: Reassemble all parts into a single temp MP4, then extract
     # both frames from the fully assembled, decodable file.
+    # FIX Bug G: pre-initialise closing_ts and probed_duration before the try
+    # block so they are always in scope for error messages and the report dict.
     assembled_path: Optional[Path] = None
     opening_frame: Optional[bytes] = None
     closing_frame: Optional[bytes] = None
+    closing_ts: str = "00:00:30"
+    probed_duration: float = 30.0
 
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
@@ -287,11 +331,20 @@ def verify_protagonist(
             for part in all_parts:
                 tmp.write(part.read_bytes())
 
+        # FIX Bug G: probe actual duration; compute a safe closing timestamp
+        # so we never seek past EOF on sub-30s reels.
+        probed_duration = get_video_duration(assembled_path)
+        closing_secs = max(1.0, min(probed_duration - 1.0, 30.0))
+        h_ts = int(closing_secs // 3600)
+        m_ts = int((closing_secs % 3600) // 60)
+        s_ts = int(closing_secs % 60)
+        closing_ts = f"{h_ts:02d}:{m_ts:02d}:{s_ts:02d}"
+
         print("  🎞️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        print("  🎞️   Extracting closing frame (t=00:00:30)…")
-        closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
+        print(f"  🎞️   Extracting closing frame (t={closing_ts}, probed {probed_duration:.1f}s)…")
+        closing_frame = extract_frame_bytes(assembled_path, closing_ts)
 
     finally:
         if assembled_path is not None:
@@ -300,8 +353,17 @@ def verify_protagonist(
             except OSError:
                 pass
 
-    if opening_frame is None or closing_frame is None:
-        print("  ⚠️   Could not extract frames (ffmpeg not available or file corrupt)")
+    # FIX Bug G: split into two separate guards so each emits an accurate
+    # diagnostic (the closing-frame guard names closing_ts in its message,
+    # distinguishing a seek-past-EOF failure from a genuine ffmpeg-not-installed case).
+    if opening_frame is None:
+        print("  ⚠️   Could not extract opening frame (ffmpeg not available or file corrupt)")
+        print("  ℹ️   Install ffmpeg to enable face-identity checking")
+        print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        return True
+
+    if closing_frame is None:
+        print(f"  ⚠️   Could not extract closing frame at {closing_ts} (seek past EOF or ffmpeg unavailable)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
         print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
         return True
@@ -317,7 +379,7 @@ def verify_protagonist(
         make_contact_sheet(
             [
                 (f"OPENING t=00:00:01\n{all_parts[0].name}", opening_frame),
-                (f"CLOSING t=00:00:30\n{all_parts[-1].name}", closing_frame),
+                (f"CLOSING t={closing_ts}\n{all_parts[-1].name}", closing_frame),
             ],
             sheet_path,
         )
@@ -328,7 +390,8 @@ def verify_protagonist(
         "opening_part": all_parts[0].name,
         "closing_part": all_parts[-1].name,
         "opening_timestamp": "00:00:01",
-        "closing_timestamp": "00:00:30",
+        "closing_timestamp": closing_ts,
+        "probed_duration_seconds": round(probed_duration, 2),
         "similarity": round(similarity, 4),
         "threshold": threshold,
         "passed": similarity >= threshold or skip_check,

@@ -14,6 +14,15 @@ Fixes (2026-07-26):
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
 
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_*. Directories
+                from the 2026-07-09 era use bare part_0, part_1, ... naming. The
+                glob returned [], so the written manifest always had "parts": 0 and
+                "parts_detail": []. When verify_integrity.py later checked those
+                directories it reported systematic MISSING PARTS / UNTRACKED
+                failures for every one of them.
+                Fix: glob both master_part_* and part_*; use a name-keyed dict
+                merge to avoid duplicates, then sort by filename.
+
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
     python tools/normalize_manifest.py --write     # actually write manifests
@@ -76,8 +85,18 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
 # ---------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
-    """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    """Schema 1a → Schema 2.
+
+    FIX Bug H: previously only globbed master_part_*, missing the bare part_*
+    naming convention used by 2026-07-09-era directories. Now globs both patterns
+    and merges by filename to avoid duplicates.
+    """
+    # FIX Bug H: glob both master_part_* and part_*; name-keyed dict merge
+    # deduplicates entries that might match both patterns, then sort by filename.
+    part_files = sorted(
+        {p.name: p for p in list(directory.glob("master_part_*")) + list(directory.glob("part_*"))}.values(),
+        key=lambda p: p.name,
+    )
     parts_info = []
     for pf in part_files:
         parts_info.append({
