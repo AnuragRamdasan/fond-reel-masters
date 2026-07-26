@@ -14,9 +14,17 @@ Fixes (2026-07-26):
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
 
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_*. Directories
+                using bare part_0, part_1... naming (2026-07-09 era) produced an
+                empty parts_detail list → manifest silently reports parts: 0 →
+                downstream verify_integrity.py sees MISSING PARTS / UNTRACKED
+                failures on every 2026-07-09 era directory.
+                Fix: glob both master_part_* and part_*, deduplicate by filename,
+                sort by name.
+
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
-    python tools/normalize_manifest.py --write     # actually write manifests
+    python tools/normalize_manifest.py --write      # actually write manifests
     python tools/normalize_manifest.py --dir 2026-07-12
     python tools/normalize_manifest.py --all --write
 """
@@ -34,9 +42,9 @@ SCHEMA_VERSION = 2
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Schema detection
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     """
@@ -71,13 +79,18 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
     return 0, None  # missing
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Normalisation functions
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
     """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    # FIX Bug H: glob both master_part_* and part_* naming conventions,
+    # deduplicate by filename, and sort by name so the list is deterministic.
+    part_files = sorted(
+        {p.name: p for p in list(directory.glob("master_part_*")) + list(directory.glob("part_*"))}.values(),
+        key=lambda p: p.name,
+    )
     parts_info = []
     for pf in part_files:
         parts_info.append({
@@ -168,9 +181,9 @@ def create_empty_manifest(directory: Path) -> Dict:
     }
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 # Main scan
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 
 def process_directory(directory: Path, write: bool = False) -> bool:
     """
@@ -208,14 +221,14 @@ def process_directory(directory: Path, write: bool = False) -> bool:
         if out_path.exists():
             backup = directory / "manifest.json.bak"
             out_path.rename(backup)
-            print(f"     Backed up old manifest to {backup.name}")
+            print(f"      Backed up old manifest to {backup.name}")
         with open(out_path, "w") as f:
             json.dump(normalised, f, indent=2)
-        print(f"     Written: {out_path}")
+        print(f"      Written: {out_path}")
     else:
-        print(f"     Would write to: {out_path}")
+        print(f"      Would write to: {out_path}")
         preview = json.dumps(normalised, indent=2)[:400]
-        print(f"     Preview:\n{preview}\n     ...")
+        print(f"      Preview:\n{preview}\n      ...")
 
     return True
 
@@ -242,7 +255,7 @@ def scan_all(root: Path, write: bool = False) -> int:
                     dirs.append(sub)
 
     for d in sorted(dirs):
-        print(f"\n📁 {d.relative_to(root)}")
+        print(f"\n\U0001f4c1 {d.relative_to(root)}")
         changed = process_directory(d, write=write)
         if changed:
             count += 1
@@ -261,7 +274,7 @@ def main():
     root = Path(args.repo_root).resolve()
 
     if not args.write:
-        print("👁 DRY RUN – pass --write to apply changes\n")
+        print("\U0001f481 DRY RUN – pass --write to apply changes\n")
 
     if args.dir:
         d = Path(args.dir).resolve()
