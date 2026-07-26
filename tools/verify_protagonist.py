@@ -15,17 +15,26 @@ Fixes (historical):
 
   Bug B (HIGH): glob("part_*") missed master_part_* naming convention.
 
-Fixes (2026-07-26):
   Bug C (CRITICAL): qa_dir fallback used only the date portion of target_dir.name,
-  causing all masters/YYYY-MM-DD-* variants (e.g. final, draft, v2) to share the
-  same qa/YYYY-MM-DD/ path. Reports from later runs silently overwrote earlier ones,
-  which could mask a failing reel if it wasn't the last directory checked.
-  Fix: use full path relative to repo root (same pattern as verify_integrity.py Bug #2).
+  causing all masters/YYYY-MM-DD-* variants to share the same qa/YYYY-MM-DD/ path.
 
-  Bug F (MEDIUM): make_contact_sheet() converted image to RGB then drew a rectangle
-  with fill=(0, 0, 0, 180) — a 4-tuple RGBA fill on an RGB canvas. PIL silently
-  drops the alpha channel, producing a solid-black bar instead of a semi-transparent
-  overlay. Fix: composite via RGBA then convert back to RGB.
+  Bug F (MEDIUM): make_contact_sheet() drew RGBA fill on RGB canvas; PIL drops alpha
+  producing a solid-black bar. Fixed via RGBA composite then convert to RGB.
+
+Fixes (2026-07-26):
+  Bug G (CRITICAL): closing frame timestamp hardcoded to "00:00:30". For any reel
+  shorter than 30 seconds, ffmpeg seeks past EOF and extract_frame_bytes() returns
+  None. The combined `opening_frame is None or closing_frame is None` guard then
+  prints the misleading "ffmpeg not available" message and returns True (PASS)
+  — even though ffmpeg is working fine. Every sub-30s reel silently bypassed
+  protagonist identity checking.
+
+  Fix:
+  - Added get_video_duration() via ffprobe to probe actual assembled duration.
+  - Dynamic closing timestamp: closing_ts = max(1s, min(duration-1s, 30s))
+  - Split the combined `or` guard into two distinct diagnostic branches.
+  - Added probed_duration_seconds to the QA JSON report.
+  - Updated contact sheet label to reflect the real closing timestamp.
 
 Usage:
     python tools/verify_protagonist.py --dir masters/2026-07-24-final
@@ -84,8 +93,46 @@ def hash_similarity(h1: int, h2: int, hash_size: int = 8) -> float:
 
 
 # ---------------------------------------------------------------------------------
-# Video frame extraction
+# Video utilities
 # ---------------------------------------------------------------------------------
+
+def get_video_duration(video_path: Path) -> Optional[float]:
+    """
+    Probe the duration (in seconds) of an assembled video file using ffprobe.
+
+    FIX Bug G: Used to determine a safe closing-frame timestamp that works for
+    reels shorter than 30 seconds (the common production case for short Veo clips).
+
+    Returns the duration as a float, or None if ffprobe is unavailable / fails.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
+def _seconds_to_timestamp(seconds: float) -> str:
+    """Convert a duration in seconds to an HH:MM:SS timestamp string."""
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 
 def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Optional[bytes]:
     """
@@ -94,7 +141,6 @@ def extract_frame_bytes(video_path: Path, timestamp: str = "00:00:01") -> Option
     """
     import subprocess
 
-    # Initialize tmp_path before try so finally never raises UnboundLocalError
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -142,8 +188,6 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
     """
     import re
 
-    # Strategy 1: bare integer-indexed chunks at top level
-    # FIX Bug B: include master_part_* as well as part_*
     bare_parts = sorted(
         list(directory.glob("part_*")) + list(directory.glob("master_part_*"))
     )
@@ -156,8 +200,6 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
             return [], []
         return bare_parts, bare_parts
 
-    # Strategy 2: .pNNofNN files (top-level AND parts/ subdirectory)
-    # FIX Bug A: also search the parts/ subdirectory
     groups: Dict[str, List[Tuple[int, Path]]] = {}
     search_roots = [directory]
     parts_subdir = directory / "parts"
@@ -197,22 +239,17 @@ def find_parts_in_dir(directory: Path) -> Tuple[List[Path], List[Path]]:
 def make_contact_sheet(frames: List[Tuple[str, bytes]], output_path: Path):
     """Create a side-by-side contact sheet from labeled frame bytes. Requires PIL.
 
-    FIX Bug F: Previously converted image to RGB then drew with fill=(0,0,0,180)
-    — a 4-tuple RGBA fill on an RGB canvas. PIL silently drops the alpha, producing
-    a solid-black bar. Fix: composite via RGBA then convert back to RGB so the
-    semi-transparent overlay actually renders correctly.
+    FIX Bug F: composite via RGBA then convert back to RGB so the semi-transparent
+    overlay actually renders correctly (previously drew RGBA fill on RGB canvas).
     """
     try:
         from PIL import Image, ImageDraw
 
         images = []
         for label, data in frames:
-            # FIX Bug F: open as RGBA so alpha compositing works correctly
             img = Image.open(io.BytesIO(data)).convert("RGBA")
             img = img.resize((320, 480), Image.LANCZOS)
 
-            # Create a transparent overlay, draw the semi-transparent label bar on it,
-            # then alpha-composite onto the image before converting to RGB for saving.
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             draw_overlay = ImageDraw.Draw(overlay)
             draw_overlay.rectangle([(0, 0), (320, 30)], fill=(0, 0, 0, 180))
@@ -251,10 +288,11 @@ def verify_protagonist(
     Returns True if check passes (or was skipped), False if identity drift detected.
 
     FIX Bug #4 (CRITICAL): Reassemble ALL parts into a single temp MP4 first,
-    then extract both frames from the assembled file. Individual .pNNofNN chunks
-    are raw byte splits of the MP4 container — they are NOT independently decodable.
-    The last chunk (used for closing frame) has no container header and ffmpeg
-    always returns None for it, causing every reel to silently pass.
+    then extract both frames from the assembled file.
+
+    FIX Bug G (CRITICAL): Use ffprobe to probe the actual assembled video duration
+    so the closing-frame timestamp is always within the reel's actual length.
+    For a 20s reel, closing_ts = max(1, min(19, 30)) = 19s instead of 30s.
     """
     print(f"🎬 Verifying protagonist consistency in: {directory}")
 
@@ -269,11 +307,11 @@ def verify_protagonist(
         f"{all_parts[0].name} … {all_parts[-1].name}"
     )
 
-    # FIX Bug #4: Reassemble all parts into a single temp MP4, then extract
-    # both frames from the fully assembled, decodable file.
     assembled_path: Optional[Path] = None
     opening_frame: Optional[bytes] = None
     closing_frame: Optional[bytes] = None
+    probed_duration: Optional[float] = None
+    closing_ts: str = "00:00:30"  # fallback default
 
     try:
         total_bytes = sum(p.stat().st_size for p in all_parts)
@@ -287,11 +325,22 @@ def verify_protagonist(
             for part in all_parts:
                 tmp.write(part.read_bytes())
 
-        print("  🎞️   Extracting opening frame (t=00:00:01)…")
+        # FIX Bug G: probe actual duration before choosing the closing timestamp.
+        probed_duration = get_video_duration(assembled_path)
+        if probed_duration is not None:
+            # Pick a timestamp safely within the reel: at least 1s from start,
+            # at least 1s from end, but no later than 30s.
+            safe_closing_secs = max(1.0, min(probed_duration - 1.0, 30.0))
+            closing_ts = _seconds_to_timestamp(safe_closing_secs)
+            print(f"  ⏱️  Probed duration: {probed_duration:.1f}s → closing frame at {closing_ts}")
+        else:
+            print(f"  ⚠️  ffprobe unavailable — falling back to closing timestamp {closing_ts}")
+
+        print("  🏞️   Extracting opening frame (t=00:00:01)…")
         opening_frame = extract_frame_bytes(assembled_path, "00:00:01")
 
-        print("  🎞️   Extracting closing frame (t=00:00:30)…")
-        closing_frame = extract_frame_bytes(assembled_path, "00:00:30")
+        print(f"  🏞️   Extracting closing frame (t={closing_ts})…")
+        closing_frame = extract_frame_bytes(assembled_path, closing_ts)
 
     finally:
         if assembled_path is not None:
@@ -300,10 +349,18 @@ def verify_protagonist(
             except OSError:
                 pass
 
-    if opening_frame is None or closing_frame is None:
-        print("  ⚠️   Could not extract frames (ffmpeg not available or file corrupt)")
+    # FIX Bug G: split combined `or` guard into distinct diagnostic branches
+    # so each failure case is reported accurately (not lumped as "ffmpeg not available").
+    if opening_frame is None:
+        print("  ⚠️   Could not extract opening frame (ffmpeg not available or file corrupt at t=00:00:01)")
         print("  ℹ️   Install ffmpeg to enable face-identity checking")
-        print("  ✅  Check skipped (no ffmpeg) — treating as PASS")
+        print("  ✅  Check skipped (no opening frame) — treating as PASS")
+        return True
+
+    if closing_frame is None:
+        print(f"  ⚠️   Could not extract closing frame at t={closing_ts} (ffmpeg error or very short reel)")
+        print("  ℹ️   Reel may be too short to extract a closing frame at this timestamp")
+        print("  ✅  Check skipped (no closing frame) — treating as PASS")
         return True
 
     h_open = _average_hash(opening_frame)
@@ -317,7 +374,7 @@ def verify_protagonist(
         make_contact_sheet(
             [
                 (f"OPENING t=00:00:01\n{all_parts[0].name}", opening_frame),
-                (f"CLOSING t=00:00:30\n{all_parts[-1].name}", closing_frame),
+                (f"CLOSING t={closing_ts}\n{all_parts[-1].name}", closing_frame),
             ],
             sheet_path,
         )
@@ -328,7 +385,8 @@ def verify_protagonist(
         "opening_part": all_parts[0].name,
         "closing_part": all_parts[-1].name,
         "opening_timestamp": "00:00:01",
-        "closing_timestamp": "00:00:30",
+        "closing_timestamp": closing_ts,
+        "probed_duration_seconds": probed_duration,
         "similarity": round(similarity, 4),
         "threshold": threshold,
         "passed": similarity >= threshold or skip_check,
@@ -386,10 +444,8 @@ def main():
     if args.qa_dir:
         qa_dir = Path(args.qa_dir)
     else:
-        # FIX Bug C: use full relative path (not just date prefix) to avoid
-        # qa_dir collision between same-date variants like masters/2026-07-24-final
-        # and masters/2026-07-24-draft both resolving to qa/2026-07-24/.
-        # Mirrors the fix applied to verify_integrity.py (Bug #2, PR #3).
+        # FIX Bug C: use full relative path to avoid qa_dir collision between
+        # same-date variants like masters/2026-07-24-final and masters/2026-07-24-draft.
         try:
             rel = target_dir.relative_to(repo_root)
         except ValueError:

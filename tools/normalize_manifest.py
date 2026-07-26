@@ -14,6 +14,15 @@ Fixes (2026-07-26):
                 path → NotADirectoryError in Python 3.11+. Fix: add if sub.is_dir()
                 guard in both loops.
 
+  Bug H (HIGH): normalise_reel_manifest() only globbed master_part_*. Directories
+                using bare part_0, part_1… naming (common in 2026-07-09 era) produce
+                an empty parts_detail list → emitted manifest silently reports
+                parts: 0 → downstream verify_integrity.py sees MISSING PARTS or
+                UNTRACKED failures on the next CI run.
+
+                Fix: glob both master_part_* and part_*, deduplicate by filename,
+                sort by name.
+
 Usage:
     python tools/normalize_manifest.py              # dry-run (show what would change)
     python tools/normalize_manifest.py --write     # actually write manifests
@@ -52,10 +61,8 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
             data = json.load(f)
         if data.get("schema") == SCHEMA_VERSION:
             return 2, data
-        # Reel manifest: has 'date', 'arm', 'parts' as top-level scalars
         if "date" in data and "arm" in data and isinstance(data.get("parts"), int):
             return 1, data  # 1a
-        # Ads-bridge manifest: values are dicts with sha256/bytes/parts
         # FIX Bug #3: guard against empty JSON {} – all() over empty iterable
         # returns True (vacuous truth), causing {} to be misdetected as schema 1b.
         if data and all(isinstance(v, dict) for v in data.values()):
@@ -76,8 +83,19 @@ def detect_schema(directory: Path) -> Tuple[int, Optional[Dict]]:
 # ---------------------------------------------------------------------------
 
 def normalise_reel_manifest(raw: Dict, directory: Path) -> Dict:
-    """Schema 1a → Schema 2."""
-    part_files = sorted(directory.glob("master_part_*"))
+    """
+    Schema 1a → Schema 2.
+
+    FIX Bug H: previously only globbed master_part_*, missing the bare part_0,
+    part_1… naming convention used by 2026-07-09 era directories. Now globs both
+    patterns, deduplicates by filename, and sorts by name.
+    """
+    # FIX Bug H: collect both master_part_* and part_* files, dedup by name, sort.
+    seen: Dict[str, Path] = {}
+    for p in list(directory.glob("master_part_*")) + list(directory.glob("part_*")):
+        seen[p.name] = p  # later entry wins, but names are unique in practice
+    part_files = sorted(seen.values(), key=lambda p: p.name)
+
     parts_info = []
     for pf in part_files:
         parts_info.append({
@@ -117,6 +135,7 @@ def normalise_ads_bridge_manifest(raw: Dict, directory: Path) -> Dict:
         "_migrated_from": "schema_1b",
     }
 
+
 def normalise_sha256_txt(raw: Dict, directory: Path) -> Dict:
     """Schema 1c (sha256sum text) → Schema 2."""
     lines = raw.get("lines", [])
@@ -144,8 +163,7 @@ def create_empty_manifest(directory: Path) -> Dict:
     if m:
         date = m.group(0)
 
-    # FIX Bug #6: `not p.suffix in (...)` parses as `(not p.suffix) in (...)`
-    # due to operator precedence, inverting the filter. Use `p.suffix not in (...)`.
+    # FIX Bug #6: `p.suffix not in (...)` (correct operator precedence)
     parts_detail = []
     for p in sorted(directory.rglob("*")):
         if p.is_file() and p.suffix not in (".jpg", ".png", ".json", ".txt", ".md"):

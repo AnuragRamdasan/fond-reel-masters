@@ -6,6 +6,9 @@ Fixes:
   Bug #1 (CRITICAL): manifest_missing not counted in exit code → silent CI pass
   Bug #2 (HIGH): QA report collision when same-named dirs exist under different parents
   Bug #4: Single-chunk .p01of01 files not mapped correctly to manifest entries
+  Bug I (LOW): Removed dead sha256_of_bytes() function which loaded entire files into
+               memory. All hashing uses the streaming sha256_of_parts() instead.
+               Eliminates risk of OOM on multi-GB video files and removes dead code.
 
 Usage:
     python tools/verify_integrity.py [--date 2026-07-11] [--dir ads-bridge/2026-07-11]
@@ -27,9 +30,9 @@ from typing import Dict, List, Optional, Tuple
 PART_RE = re.compile(r"^(.+)\.p(\d{2})of(\d{2})$")
 CHUNK_SIZE = 65536  # 64 KB read buffer
 
-
-def sha256_of_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+# NOTE: sha256_of_bytes() was removed (Bug I fix). It loaded entire files into
+# memory (OOM risk on multi-GB videos) and was never called — all hashing uses
+# the streaming sha256_of_parts() below.
 
 
 def sha256_of_parts(part_paths: List[Path]) -> Tuple[str, int]:
@@ -199,7 +202,7 @@ def write_report(report: Dict, qa_dir: Path):
     report_path = qa_dir / "integrity_report.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"  \U0001f4c4 Report written to {report_path}")
+    print(f"  📄 Report written to {report_path}")
 
 
 def scan_repo(root: Path, dry_run: bool = False) -> int:
@@ -217,7 +220,7 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
                     dirs_to_check.append(sub)
 
     for d in sorted(dirs_to_check):
-        print(f"\n\U0001f4c1 Checking: {d}")
+        print(f"\n📁 Checking: {d}")
         report = verify_directory(d, dry_run=dry_run)
 
         # FIX Bug #1: include manifest_missing in failure count
@@ -232,8 +235,7 @@ def scan_repo(root: Path, dry_run: bool = False) -> int:
 
         if not dry_run:
             # FIX Bug #2: use full relative path to avoid collision between
-            # same-named dirs under different parents (e.g. ads-bridge/2026-07-11
-            # and masters/2026-07-11 both have d.name == '2026-07-11').
+            # same-named dirs under different parents.
             qa_dir = root / "qa" / str(d.relative_to(root)).replace("/", "-")
             write_report(report, qa_dir)
 
@@ -252,7 +254,7 @@ def main():
 
     if args.dir:
         d = Path(args.dir).resolve()
-        print(f"\U0001f4c1 Checking: {d}")
+        print(f"📁 Checking: {d}")
         report = verify_directory(d, dry_run=args.dry_run)
         if not args.dry_run:
             # FIX Bug #2: unique qa dir per relative path, not just d.name
