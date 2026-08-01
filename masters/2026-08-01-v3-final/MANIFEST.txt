@@ -1,0 +1,9 @@
+master: fond_reel_2026-08-01_handwriting_v3.mp4
+sha256: 7ae7cf5dbc86d5359d282e375d9572e42ac9471fb1d2e78c169d639c83d915e5
+runtime: 15.85s (video 15.833 / audio 15.850)
+size: 11469636 bytes
+LUFS: -14.2 (audio byte-copied from v2 master)
+segments: U1(6186641 opening leather-look journal)+U2(8519540 writing in black leather journal) NEW; U3/U4/U5 byte-identical from v2
+uguu_mp4: https://h.uguu.se/jBZjnjUa.mp4
+uguu_cover: https://d.uguu.se/SRoDmQJQ.jpg
+pexels_clips: 6186641, 8519540
